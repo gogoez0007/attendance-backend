@@ -135,7 +135,7 @@ exports.handleAttendance = async (req, res) => {
                 [check_in_time, check_in_latitude, check_in_longitude, attendance.id]
             );
             console.log('ini adalaah ', check_in_time);
-            res.json({ message: 'Check-out berhasil' });
+            res.status(201).json({ message: 'Check-out berhasil' });
         }
     } catch (err) {
         res.status(500).json({ error: err.message });
