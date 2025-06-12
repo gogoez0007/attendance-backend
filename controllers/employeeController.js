@@ -41,7 +41,7 @@ exports.loginAuth = async (req, res) => {
                             c.radius_meters
                         FROM users a 
                         LEFT JOIN shifts b ON a.shift_id=b.id
-                        LEFT JOIN locations c ON a.location_id = b.id
+                        LEFT JOIN locations c ON a.location_id = c.id
                         WHERE username = ? AND password = ?
                     `;
 
