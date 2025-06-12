@@ -7,6 +7,7 @@ router.get('/:id', employeeController.getEmployeeById);
 router.post('/', employeeController.createEmployee);
 router.post('/auth', employeeController.loginAuth);
 router.put('/:id', employeeController.updateEmployee);
+router.put('/token/:id', employeeController.updateTokenFirebase);
 router.delete('/:id', employeeController.deleteEmployee);
 
 module.exports = router;

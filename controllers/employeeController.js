@@ -47,7 +47,7 @@ exports.loginAuth = async (req, res) => {
 
     
         // console.log('Query:', query);
-        // console.log('Parameters:', [username, password]);
+        console.log('Parameters:', [username, password]);
 
         const [rows] = await db.query(query, [username, password]);
 
@@ -55,7 +55,7 @@ exports.loginAuth = async (req, res) => {
             return res.status(404).json({ message: 'Employee not found' });
         }
         
-        res.json(rows[0]);
+        res.status(200).json(rows[0]);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -93,6 +93,18 @@ exports.deleteEmployee = async (req, res) => {
         const { id } = req.params;
         await db.query('DELETE FROM users WHERE id = ?', [id]);
         res.json({ message: 'Employee deleted successfully' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
+exports.updateTokenFirebase = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { token } = req.body;
+        await db.query('UPDATE users SET token = ? WHERE id = ?',
+            [token, id]);
+        res.json({ message: 'Token updated successfully' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

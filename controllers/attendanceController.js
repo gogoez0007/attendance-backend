@@ -14,13 +14,36 @@ exports.getAttendances = async (req, res) => {
 exports.getAttendanceById = async (req, res) => {
     try {
         const { id } = req.params;
-        const [rows] = await db.query('SELECT * FROM attendance WHERE user_id = ? AND date=Date(now())', [id]);
+        const { month, year } = req.query;
+
+        // Jika tidak ada parameter month dan year, gunakan tanggal hari ini
+        const today = new Date();
+        let queryDateStart;
+        let queryDateEnd;
+
+        if (month && year) {
+            // Validasi bulan dan tahun jika ada
+            if (isNaN(month) || isNaN(year) || month < 1 || month > 12 || year < 1000 || year > 9999) {
+                return res.status(400).json({ message: 'Invalid month or year' });
+            }
+            // Membuat tanggal awal dan akhir bulan
+            queryDateStart = `${year}-${String(month).padStart(2, '0')}-01`; // Tanggal pertama bulan yang diminta
+            queryDateEnd = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`; // Tanggal terakhir bulan yang diminta
+        } else {
+            // Gunakan tanggal hari ini
+            queryDateStart = today.toISOString().split('T')[0]; // Tanggal pertama hari ini
+            queryDateEnd = today.toISOString().split('T')[0];   // Tanggal terakhir hari ini
+        }
+
+        const [rows] = await db.query('SELECT * FROM attendance WHERE user_id = ? AND date BETWEEN ? AND ?', [id, queryDateStart, queryDateEnd]);
+
         if (rows.length === 0) return res.status(404).json({ message: 'Attendance not found' });
-        res.json(rows[0]);
+        res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 };
+
 
 // ✅ Create Attendance
 exports.createAttendance = async (req, res) => {
