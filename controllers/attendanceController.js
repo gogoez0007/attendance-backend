@@ -9,36 +9,54 @@ exports.getAttendances = async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 };
-
-// ✅ Get Attendance by ID
+// ✅ Get Attendance by ID + Summary Telat
 exports.getAttendanceById = async (req, res) => {
     try {
         const { id } = req.params;
         const { month, year } = req.query;
 
-        // Jika tidak ada parameter month dan year, gunakan tanggal hari ini
         const today = new Date();
         let queryDateStart;
         let queryDateEnd;
 
         if (month && year) {
-            // Validasi bulan dan tahun jika ada
             if (isNaN(month) || isNaN(year) || month < 1 || month > 12 || year < 1000 || year > 9999) {
                 return res.status(400).json({ message: 'Invalid month or year' });
             }
-            // Membuat tanggal awal dan akhir bulan
-            queryDateStart = `${year}-${String(month).padStart(2, '0')}-01`; // Tanggal pertama bulan yang diminta
-            queryDateEnd = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`; // Tanggal terakhir bulan yang diminta
+            queryDateStart = `${year}-${String(month).padStart(2, '0')}-01`;
+            queryDateEnd = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
         } else {
-            // Gunakan tanggal hari ini
-            queryDateStart = today.toISOString().split('T')[0]; // Tanggal pertama hari ini
-            queryDateEnd = today.toISOString().split('T')[0];   // Tanggal terakhir hari ini
+            const todayStr = today.toISOString().split('T')[0];
+            queryDateStart = todayStr;
+            queryDateEnd = todayStr;
         }
 
-        const [rows] = await db.query('SELECT * FROM attendance WHERE user_id = ? AND date BETWEEN ? AND ?', [id, queryDateStart, queryDateEnd]);
+        // Ambil data attendance
+        const [rows] = await db.query(
+            'SELECT * FROM attendance WHERE user_id = ? AND date BETWEEN ? AND ?', 
+            [id, queryDateStart, queryDateEnd]
+        );
 
-        if (rows.length === 0) return res.status(404).json({ message: 'Attendance not found' });
-        res.json(rows);
+        // Hitung jumlah keterlambatan user tersebut
+        const [lateSummary] = await db.query(
+            `SELECT COUNT(*) AS late_count 
+             FROM attendance a
+             JOIN shifts s ON a.user_id = ? AND a.date BETWEEN ? AND ?
+             AND s.id = (SELECT shift_id FROM users WHERE id = ?) 
+             WHERE TIMESTAMPDIFF(SECOND, s.start_time, a.check_in_time) > 59`, 
+            [id, queryDateStart, queryDateEnd, id]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'Attendance not found' });
+        }
+
+        res.json({
+            attendance: rows,
+            summary: {
+                late_count: lateSummary[0].late_count || 0
+            }
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
