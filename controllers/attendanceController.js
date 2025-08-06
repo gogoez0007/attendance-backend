@@ -1,4 +1,5 @@
 const db = require('../db');
+const notificationService = require('../services/notificationService');
 
 // ✅ Get All Attendances
 exports.getAttendances = async (req, res) => {
@@ -57,20 +58,19 @@ exports.deleteAttendance = async (req, res) => {
     }
 };
 
-
-
 exports.handleAttendance = async (req, res) => {
     try {
         const { user_id, check_in_time, check_in_latitude, check_in_longitude } = req.body;
 
         const [userRows] = await db.query(
-            'SELECT shift_id FROM users WHERE id = ?',
+            'SELECT shift_id, name FROM users WHERE id = ?',
             [user_id]
         );
         if (userRows.length === 0) {
             return res.status(404).json({ message: 'User tidak ditemukan' });
         }
         const shiftId = userRows[0].shift_id;
+        const namaLengkap = userRows[0].name;
 
         const [shiftRows] = await db.query(
             'SELECT start_time, end_time, tolerance_start_time FROM shifts WHERE id = ?',
@@ -157,6 +157,7 @@ exports.handleAttendance = async (req, res) => {
             return res.status(400).json({ message: 'Waktu check-in melewati batas toleransi' });
         }
 
+        // Insert attendance
         await db.query(
             `INSERT INTO attendance 
             (user_id, check_in_time, check_in_latitude, check_in_longitude, date) 
@@ -164,10 +165,24 @@ exports.handleAttendance = async (req, res) => {
             [user_id, check_in_time, check_in_latitude, check_in_longitude, shiftDate]
         );
 
+        // === Kirim notifikasi ke user_id 23 ===
+        try {
+            await notificationService.sendFCMNotification(
+                [23,15],
+                '📲 Notifikasi Absensi',
+                `${namaLengkap} berhasil absen pada ${new Date(check_in_time).toLocaleTimeString('id-ID')}`,
+                'https://delmargroup.id/wp-content/uploads/2025/07/KPI.jpg'
+            );
+            
+            console.log(`✅ Notif dikirim ke user 23 untuk absen ${namaLengkap}`);
+        } catch (notifErr) {
+            console.error('❌ Gagal kirim notif absen:', notifErr.message);
+        }
+
         return res.status(201).json({ message: 'Check-in berhasil', type: 'checkin' });
 
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
     }
-}
+};
