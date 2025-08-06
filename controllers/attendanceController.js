@@ -57,86 +57,117 @@ exports.deleteAttendance = async (req, res) => {
     }
 };
 
-// ✅ Handle Attendance (Check-in/Check-out)
+
+
 exports.handleAttendance = async (req, res) => {
     try {
         const { user_id, check_in_time, check_in_latitude, check_in_longitude } = req.body;
 
-        console.log('ini adalaah ', req.body);
-        // Dapatkan shift dan toleransi waktu untuk user
         const [userRows] = await db.query(
             'SELECT shift_id FROM users WHERE id = ?',
             [user_id]
         );
-
         if (userRows.length === 0) {
             return res.status(404).json({ message: 'User tidak ditemukan' });
         }
-
         const shiftId = userRows[0].shift_id;
 
         const [shiftRows] = await db.query(
             'SELECT start_time, end_time, tolerance_start_time FROM shifts WHERE id = ?',
             [shiftId]
         );
-
         if (shiftRows.length === 0) {
             return res.status(404).json({ message: 'Shift tidak ditemukan' });
         }
 
         const { start_time, end_time, tolerance_start_time } = shiftRows[0];
+        const checkDateTime = new Date(check_in_time);
 
-        // Cek apakah sudah ada data absensi untuk user_id pada tanggal hari ini
-        const [attendanceRows] = await db.query(
-            'SELECT id, check_in_time, check_out_time FROM attendance WHERE user_id = ? AND date = CURDATE()',
-            [user_id]
+        const createDateTime = (timeStr, baseDate, addDay = 0) => {
+            const [h, m] = timeStr.split(':').map(Number);
+            const dt = new Date(baseDate);
+            dt.setHours(h, m, 0, 0);
+            if (addDay) dt.setDate(dt.getDate() + addDay);
+            return dt;
+        };
+
+        const [startH] = start_time.split(':').map(Number);
+        const [endH] = end_time.split(':').map(Number);
+        const overnight = endH < startH;
+        
+        const todayStr = checkDateTime.toISOString().slice(0, 10);
+        const yesterday = new Date(checkDateTime);
+        if(overnight)
+            yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayStr = yesterday.toISOString().slice(0, 10);
+
+        const [openAttendanceRows] = await db.query(
+            `SELECT * FROM attendance
+             WHERE user_id = ?
+               AND check_out_time IS NULL
+               AND date IN (?, ?)
+             ORDER BY date DESC
+             LIMIT 1`,
+            [user_id, todayStr, yesterdayStr]
         );
 
-        if (attendanceRows.length === 0) {
-            // Jika belum ada data absensi untuk hari ini
-            const checkInDateTime = new Date(check_in_time);
-            const startDateTime = new Date();
-            const [startHours, startMinutes] = start_time.split(':');
-            startDateTime.setHours(startHours, startMinutes, 0, 0);
+        if (openAttendanceRows.length > 0) {
+            const attendance = openAttendanceRows[0];
+            const checkInDate = new Date(attendance.date);
+            const shiftStartForCheckout = createDateTime(start_time, checkInDate, 0);
+            const shiftEndForCheckout = createDateTime(end_time, shiftStartForCheckout, overnight ? 1 : 0);
 
-            const [toleranceHours, toleranceMinutes] = tolerance_start_time.split(':');
-            startDateTime.setHours(startDateTime.getHours() + parseInt(toleranceHours));
-            startDateTime.setMinutes(startDateTime.getMinutes() + parseInt(toleranceMinutes));
-
-            if (checkInDateTime > startDateTime) {
-                return res.status(400).json({ message: 'Waktu check-in telah melewati batas toleransi' });
-            }
-
-            await db.query(
-                'INSERT INTO attendance (user_id, check_in_time, check_in_latitude, check_in_longitude, date) VALUES (?, ?, ?, ?, date(now()))',
-                [user_id, check_in_time, check_in_latitude, check_in_longitude]
-            );
-            res.status(201).json({ message: 'Check-in berhasil' });
-        } else {
-            // Jika sudah ada data absensi untuk hari ini
-            const attendance = attendanceRows[0];
-
-            if (attendance.check_out_time) {
-                return res.status(400).json({ message: 'Anda sudah melakukan check-out hari ini' });
-            }
-
-            const checkOutDateTime = new Date(check_in_time);
-            const endDateTime = new Date();
-            const [endHours, endMinutes] = end_time.split(':');
-            endDateTime.setHours(endHours, endMinutes, 0, 0);
-
-            if (checkOutDateTime < endDateTime) {
+            if (checkDateTime < shiftEndForCheckout) {
                 return res.status(400).json({ message: 'Belum waktunya untuk check-out' });
             }
 
             await db.query(
-                'UPDATE attendance SET check_out_time = ?, check_out_latitude = ?, check_out_longitude = ? WHERE id = ?',
+                `UPDATE attendance 
+                 SET check_out_time = ?, check_out_latitude = ?, check_out_longitude = ? 
+                 WHERE id = ?`,
                 [check_in_time, check_in_latitude, check_in_longitude, attendance.id]
             );
-            console.log('ini adalaah ', check_in_time);
-            res.status(201).json({ message: 'Check-out berhasil' });
+
+            return res.status(200).json({ message: 'Check-out berhasil', type: 'checkout' });
         }
+        
+        let shiftStart = createDateTime(start_time, checkDateTime, 0);
+        
+        if (overnight && checkDateTime.getHours() < endH) {
+            shiftStart.setDate(shiftStart.getDate() - 1);
+        }
+        
+        const shiftDate = shiftStart.toISOString().slice(0, 10);
+
+        const [existingAttendance] = await db.query(
+            'SELECT * FROM attendance WHERE user_id = ? AND date = ?',
+            [user_id, shiftDate]
+        );
+
+        if (existingAttendance.length > 0) {
+            return res.status(400).json({ message: 'Anda sudah melakukan absen untuk shift ini.' });
+        }
+        
+        const toleranceLimit = new Date(shiftStart);
+        const [tolH, tolM] = tolerance_start_time.split(':').map(Number);
+        toleranceLimit.setHours(toleranceLimit.getHours() + tolH);
+        toleranceLimit.setMinutes(toleranceLimit.getMinutes() + tolM);
+        
+        if (checkDateTime > toleranceLimit) { 
+            return res.status(400).json({ message: 'Waktu check-in melewati batas toleransi' });
+        }
+
+        await db.query(
+            `INSERT INTO attendance 
+            (user_id, check_in_time, check_in_latitude, check_in_longitude, date) 
+            VALUES (?, ?, ?, ?, ?)`,
+            [user_id, check_in_time, check_in_latitude, check_in_longitude, shiftDate]
+        );
+
+        return res.status(201).json({ message: 'Check-in berhasil', type: 'checkin' });
+
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: err.message });
     }
-};
+}
