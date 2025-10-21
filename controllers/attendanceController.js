@@ -198,7 +198,7 @@ exports.handleAttendance = async (req, res) => {
       [user_id, yesterdayStr]
     );
 
-    if (openYesterday) {
+   if (openYesterday) {
       const attDateStr = toYMD(openYesterday.date);
       const effY = await getEffectiveShift(db, user_id, attDateStr, defaultShiftId);
 
@@ -212,40 +212,47 @@ exports.handleAttendance = async (req, res) => {
         if (isOvernightY) endDTy.setDate(endDTy.getDate() + 1);
         const endDateStrY = toYMD(endDTy);
 
-        // RULE: auto-checkout kemarin HANYA jika:
-        // - shift kemarin overnight
-        // - end date = today
-        // - TIDAK ada jadwal eksplisit untuk today
-        if (isOvernightY && endDateStrY === todayStr && !hasSchToday) {
+        if (isOvernightY && endDateStrY === todayStr) {
+          // shift berikutnya (hari ini)
+          const nextShift = await getEffectiveShift(db, user_id, todayStr, defaultShiftId);
+          const nextStartDT = nextShift ? makeDateTime(todayStr, nextShift.start_time) : null;
+          const latestCheckout = nextStartDT ? new Date(nextStartDT.getTime() - 2 * 60 * 60 * 1000) : null;
+
+          // Belum lewat end time kemarin -> masih jam kerja -> tolak checkout
           if (ts < endDTy) {
             return res.status(400).json({ message: 'Belum waktunya untuk check-out' });
           }
 
-          await db.query(
-            `UPDATE attendance
-               SET check_out_time = ?, check_out_latitude = ?, check_out_longitude = ?
-             WHERE id = ?`,
-            [check_in_time, check_in_latitude, check_in_longitude, openYesterday.id]
-          );
-
-          // Notifikasi (opsional)
-          try {
-            await notificationService.sendFCMNotification(
-              [23, 15],
-              '📲 Notifikasi Absensi',
-              `${namaLengkap} berhasil absen pulang pada ${new Date(check_in_time).toLocaleTimeString('id-ID')}`,
-              'https://delmargroup.id/wp-content/uploads/2025/07/KPI.jpg'
+          // === KUNCI PERUBAHAN ===
+          // Jika SUDAH melewati (nextStart - 2 jam), JANGAN error -> biarkan lanjut ke CHECK-IN flow
+          if (latestCheckout && ts > latestCheckout) {
+            // do nothing: skip checkout kemarin, lanjut ke check-in di bawah (fallthrough)
+          } else {
+            // (Tidak ada nextShift, ATAU masih <= deadline) -> boleh check-out kemarin
+            await db.query(
+              `UPDATE attendance
+                SET check_out_time = ?, check_out_latitude = ?, check_out_longitude = ?
+              WHERE id = ?`,
+              [check_in_time, check_in_latitude, check_in_longitude, openYesterday.id]
             );
-          } catch (notifErr) {
-            console.error('❌ Gagal kirim notif absen:', notifErr?.message || notifErr);
-          }
 
-          return res.status(200).json({ message: 'Check-out berhasil', type: 'checkout' });
+            try {
+              await notificationService.sendFCMNotification(
+                [23, 15],
+                '📲 Notifikasi Absensi',
+                `${namaLengkap} berhasil absen pulang pada ${new Date(check_in_time).toLocaleTimeString('id-ID')}`,
+                'https://delmargroup.id/wp-content/uploads/2025/07/KPI.jpg'
+              );
+            } catch (notifErr) {
+              console.error('❌ Gagal kirim notif absen:', notifErr?.message || notifErr);
+            }
+
+            return res.status(200).json({ message: 'Check-out berhasil', type: 'checkout' });
+          }
         }
-        // Jika ada jadwal eksplisit today ATAU shift kemarin bukan overnight → JANGAN close kemarin.
-        // Lanjutkan ke alur check-in.
+        // Jika bukan overnight yg berakhir hari ini -> langsung fallthrough ke check-in
       }
-      // Kalau tidak ada shift kemarin → juga jangan close; lanjutkan check-in.
+      // fallthrough: lanjut ke CHECK-IN flow di bawah
     }
 
     // 4) CHECK-IN flow
