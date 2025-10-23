@@ -188,7 +188,7 @@ exports.handleAttendance = async (req, res) => {
         console.error('❌ Gagal kirim notif absen:', notifErr?.message || notifErr);
       }
 
-      return res.status(200).json({ message: 'Check-out berhasil', type: 'checkout' });
+      return res.status(201).json({ message: 'Check-out berhasil', type: 'checkout' });
     }
 
     //    b) Jika tidak ada open hari ini, cek open kemarin
@@ -247,7 +247,7 @@ exports.handleAttendance = async (req, res) => {
               console.error('❌ Gagal kirim notif absen:', notifErr?.message || notifErr);
             }
 
-            return res.status(200).json({ message: 'Check-out berhasil', type: 'checkout' });
+            return res.status(201).json({ message: 'Check-out berhasil', type: 'checkout' });
           }
         }
         // Jika bukan overnight yg berakhir hari ini -> langsung fallthrough ke check-in
@@ -310,7 +310,7 @@ exports.handleAttendance = async (req, res) => {
       [user_id, check_in_time, check_in_latitude, check_in_longitude, shiftDateStr]
     );
 
-    // Notifikasi (opsional)
+    Notifikasi (opsional)
     try {
       await notificationService.sendFCMNotification(
         [23, 15],
@@ -330,3 +330,196 @@ exports.handleAttendance = async (req, res) => {
   }
 };
 
+// ✅ Nilai & Grade (rumus Excel) + ringkasan + total_alpa + absen_datang/pulang (di end_effective)
+exports.getNilaiGrade = async (req, res) => {
+  // helper
+  const isWeekendDate = (dateStr) => {
+    const d = new Date(`${dateStr}T00:00:00`);
+    const day = d.getDay(); // 0=Min,6=Sab
+    return day === 0 || day === 6;
+  };
+  const addDays = (dateStr, n) => {
+    const d = new Date(`${dateStr}T00:00:00`);
+    d.setDate(d.getDate() + n);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${dd}`;
+  };
+  const cmpDate = (a, b) => (a === b ? 0 : (a < b ? -1 : 1));
+  const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00`).getTime());
+
+  // bucket skor ala Excel
+  const scoreFromCount = (n) => (n >= 5 ? 0 : n === 4 ? 20 : n === 3 ? 40 : n === 2 ? 60 : n === 1 ? 80 : 100);
+  const alpaFactor     = (n) => (n >= 5 ? 0.0 : n === 4 ? 0.2 : n === 3 ? 0.4 : n === 2 ? 0.6 : n === 1 ? 0.8 : 1.0);
+
+  try {
+    const { user_id } = req.query;
+    let { start_date, end_date, start, end, bulan, tahun } = req.query;
+
+    // normalisasi alias param
+    start_date = (start_date || start || '').trim();
+    end_date   = (end_date   || end   || '').trim();
+
+    // validasi user
+    const userIdInt = Number(user_id);
+    if (!Number.isInteger(userIdInt)) {
+      return res.status(400).json({ error: "Param wajib: user_id harus angka" });
+    }
+    const [[user]] = await db.query('SELECT id, shift_id FROM users WHERE id = ? LIMIT 1', [userIdInt]);
+    if (!user) return res.status(404).json({ error: 'User tidak ditemukan.' });
+
+    // tentukan rentang tanggal
+    let startDate, endDate;
+    if (start_date && end_date) {
+      if (!isValidYMD(start_date) || !isValidYMD(end_date)) {
+        return res.status(400).json({ error: "Format tanggal harus YYYY-MM-DD (start_date & end_date)" });
+      }
+      if (cmpDate(start_date, end_date) === 1) {
+        return res.status(400).json({ error: "start_date tidak boleh lebih besar dari end_date" });
+      }
+      startDate = start_date;
+      endDate   = end_date;
+    } else {
+      // fallback: bulan & tahun
+      const monthNum = Number(bulan);
+      const yearNum  = Number(tahun);
+      if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12 ||
+          !Number.isInteger(yearNum) || String(tahun || '').length !== 4) {
+        return res.status(400).json({
+          error: "Gunakan start_date & end_date (YYYY-MM-DD), atau bulan=1-12 & tahun=YYYY"
+        });
+      }
+      const daysInMonth = new Date(yearNum, monthNum, 0).getDate();
+      startDate = `${yearNum}-${String(monthNum).padStart(2, "0")}-01`;
+      endDate   = `${yearNum}-${String(monthNum).padStart(2, "0")}-${String(daysInMonth).padStart(2, "0")}`;
+    }
+
+    // clamp endDate ke hari ini supaya hari depan tidak dihitung ALPA
+    const today = new Date();
+    const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+    const effectiveEnd = (cmpDate(endDate, todayStr) === 1) ? todayStr : endDate;
+
+    // ambil attendance & leave HANYA dalam rentang efektif
+    const [attendance] = await db.query(
+      `SELECT 
+         DATE_FORMAT(a.date,'%Y-%m-%d')         AS date,
+         TIME_FORMAT(a.check_in_time,'%H:%i')   AS check_in_time,
+         TIME_FORMAT(a.check_out_time,'%H:%i')  AS check_out_time,
+         a.leave_request_id,
+         lr.leave_type
+       FROM attendance a
+       LEFT JOIN leave_requests lr ON lr.id = a.leave_request_id
+       WHERE a.user_id = ? AND a.date BETWEEN ? AND ?`,
+      [userIdInt, startDate, effectiveEnd]
+    );
+    const attMap = new Map(attendance.map(r => [r.date, r]));
+
+    // telat > 3 menit (pakai default shift user)
+    const [lateRows] = await db.query(
+      `SELECT 
+         DATE_FORMAT(a.date,'%Y-%m-%d') AS date,
+         TIMESTAMPDIFF(SECOND, s.start_time, a.check_in_time) AS diff_sec
+       FROM attendance a
+       JOIN users u  ON u.id = a.user_id
+       LEFT JOIN shifts s ON s.id = u.shift_id
+       WHERE a.user_id = ?
+         AND a.date BETWEEN ? AND ?
+         AND a.check_in_time IS NOT NULL`,
+      [userIdInt, startDate, effectiveEnd]
+    );
+    const lateSet = new Set(lateRows.filter(r => r.diff_sec != null && r.diff_sec > 180).map(r => r.date));
+
+    // ===== agregasi ala Excel =====
+    let tidakLengkap = 0;
+    let alpa = 0;                // <= ini yg diminta: total_alpa
+    let ijin = 0;
+    let sakit = 0;               // ikut penalti (digabung dgn ijin)
+    let sd = 0;                  // tidak ikut penalti
+    let terlambatHari = 0;
+    let totalAbsenLengkap = 0;   // lengkap tanpa leave (semua hari dalam rentang)
+
+    // iterasi per hari dalam [startDate .. effectiveEnd]
+    for (let d = startDate; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
+      const rec = attMap.get(d);
+
+      // total absen lengkap: semua hari (weekend juga), tanpa leave, in & out ada, in ≠ '00:00'
+      if (rec && !rec.leave_request_id && rec.check_in_time && rec.check_out_time && rec.check_in_time !== '00:00') {
+        totalAbsenLengkap += 1;
+      }
+
+      // penalti: hanya hari kerja
+      if (!isWeekendDate(d)) {
+        if (!rec) {
+          alpa += 1;
+        } else if (rec.leave_request_id) {
+          if (rec.leave_type === 'SICK_NO_CERT') {
+            sakit += 1; // dihitung ke komponen ijin+sakit
+          } else if (rec.leave_type === 'SICK_WITH_CERT') {
+            sd += 1;    // tidak dihitung penalti
+          } else if (['PLANNED_ABSENCE','UNPLANNED_ABSENCE','LEAVE_WORKPLACE'].includes(rec.leave_type)) {
+            ijin += 1;  // dihitung penalti
+          }
+        } else {
+          const hasIn  = !!rec.check_in_time;
+          const hasOut = !!rec.check_out_time;
+          if ((hasIn && !hasOut) || (!hasIn && hasOut)) {
+            tidakLengkap += 1;
+          }
+          if (lateSet.has(d)) {
+            terlambatHari += 1;
+          }
+        }
+      }
+    }
+
+    // === komponen nilai persis Excel + ROUND(...,0)
+    const komponen =
+      (scoreFromCount(tidakLengkap) * 0.30) +
+      (scoreFromCount(ijin + sakit) * 0.40) +
+      (scoreFromCount(terlambatHari) * 0.30);
+
+    const nilai = Math.round(komponen * alpaFactor(alpa));
+
+    // Grade
+    let grade = "";
+    if (nilai >= 90) grade = "A";
+    else if (nilai >= 70 && nilai <= 89) grade = "B";
+    else if (nilai >= 50 && nilai <= 69) grade = "C";
+    else if (nilai >= 30 && nilai <= 49) grade = "D";
+    else if (nilai <= 29) grade = "E";
+
+    // === ambil jam absen pada tanggal end_effective (untuk success screen)
+    const [[todayAtt]] = await db.query(
+      `SELECT 
+         TIME_FORMAT(check_in_time,'%H:%i')  AS check_in_time,
+         TIME_FORMAT(check_out_time,'%H:%i') AS check_out_time
+       FROM attendance
+       WHERE user_id = ? AND date = ?
+       LIMIT 1`,
+      [userIdInt, effectiveEnd]
+    );
+
+    const absenDatang = todayAtt?.check_in_time || null;
+    const absenPulang = todayAtt?.check_out_time || null;
+
+    // respons
+    return res.json({
+      periode: { start: startDate, end: endDate, end_effective: effectiveEnd },
+      nilai,
+      grade,
+      total_absen_lengkap: totalAbsenLengkap,
+      total_izin: ijin,                 // PLANNED/UNPLANNED/LW pada hari kerja
+      total_telat: terlambatHari,       // hari kerja, >3 menit
+      total_tidak_lengkap: tidakLengkap,
+      total_alpa: alpa,                 // 👈 tambahan yang diminta
+      // alias opsional agar tidak rancu "alpha" vs "alpa": uncomment kalau mau
+      // total_alpha: alpa,
+      absen_datang: absenDatang,        // 👈 jam HH:mm pada end_effective (kalau ada)
+      absen_pulang: absenPulang         // 👈 jam HH:mm pada end_effective (kalau ada)
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Terjadi kesalahan server: " + err.message });
+  }
+};
