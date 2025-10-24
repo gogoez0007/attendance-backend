@@ -310,7 +310,7 @@ exports.handleAttendance = async (req, res) => {
       [user_id, check_in_time, check_in_latitude, check_in_longitude, shiftDateStr]
     );
 
-    Notifikasi (opsional)
+    // Notifikasi (opsional)
     try {
       await notificationService.sendFCMNotification(
         [23, 15],
