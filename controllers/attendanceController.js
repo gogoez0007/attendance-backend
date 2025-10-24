@@ -332,12 +332,7 @@ exports.handleAttendance = async (req, res) => {
 
 // ✅ Nilai & Grade (rumus Excel) + ringkasan + total_alpa + absen_datang/pulang (di end_effective)
 exports.getNilaiGrade = async (req, res) => {
-  // helper
-  const isWeekendDate = (dateStr) => {
-    const d = new Date(`${dateStr}T00:00:00`);
-    const day = d.getDay(); // 0=Min,6=Sab
-    return day === 0 || day === 6;
-  };
+  // helper tanggal
   const addDays = (dateStr, n) => {
     const d = new Date(`${dateStr}T00:00:00`);
     d.setDate(d.getDate() + n);
@@ -348,6 +343,16 @@ exports.getNilaiGrade = async (req, res) => {
   };
   const cmpDate = (a, b) => (a === b ? 0 : (a < b ? -1 : 1));
   const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00`).getTime());
+  const isWeekend = (dateStr) => {
+    const d = new Date(`${dateStr}T00:00:00`);
+    const day = d.getDay(); // 0=Min,6=Sab
+    return day === 0 || day === 6;
+  };
+  const isWorkdayByLocation = (dateStr, locationId) => {
+    return Number(locationId) === 1 ? !isWeekend(dateStr) : true;
+  };
+  const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
+  const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
 
   // bucket skor ala Excel
   const scoreFromCount = (n) => (n >= 5 ? 0 : n === 4 ? 20 : n === 3 ? 40 : n === 2 ? 60 : n === 1 ? 80 : 100);
@@ -366,7 +371,8 @@ exports.getNilaiGrade = async (req, res) => {
     if (!Number.isInteger(userIdInt)) {
       return res.status(400).json({ error: "Param wajib: user_id harus angka" });
     }
-    const [[user]] = await db.query('SELECT id, shift_id FROM users WHERE id = ? LIMIT 1', [userIdInt]);
+    // butuh location_id untuk aturan weekend
+    const [[user]] = await db.query('SELECT id, shift_id, location_id FROM users WHERE id = ? LIMIT 1', [userIdInt]);
     if (!user) return res.status(404).json({ error: 'User tidak ditemukan.' });
 
     // tentukan rentang tanggal
@@ -381,7 +387,6 @@ exports.getNilaiGrade = async (req, res) => {
       startDate = start_date;
       endDate   = end_date;
     } else {
-      // fallback: bulan & tahun
       const monthNum = Number(bulan);
       const yearNum  = Number(tahun);
       if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12 ||
@@ -407,7 +412,8 @@ exports.getNilaiGrade = async (req, res) => {
          TIME_FORMAT(a.check_in_time,'%H:%i')   AS check_in_time,
          TIME_FORMAT(a.check_out_time,'%H:%i')  AS check_out_time,
          a.leave_request_id,
-         lr.leave_type
+         lr.leave_type,
+         lr.reason
        FROM attendance a
        LEFT JOIN leave_requests lr ON lr.id = a.leave_request_id
        WHERE a.user_id = ? AND a.date BETWEEN ? AND ?`,
@@ -428,52 +434,78 @@ exports.getNilaiGrade = async (req, res) => {
          AND a.check_in_time IS NOT NULL`,
       [userIdInt, startDate, effectiveEnd]
     );
-    const lateSet = new Set(lateRows.filter(r => r.diff_sec != null && r.diff_sec > 180).map(r => r.date));
+    const lateMap = new Map(lateRows.map(r => [r.date, r.diff_sec]));
 
-    // ===== agregasi ala Excel =====
+    // ===== agregasi =====
     let tidakLengkap = 0;
-    let alpa = 0;                // <= ini yg diminta: total_alpa
+    let alpa = 0;              // total_alpa
     let ijin = 0;
-    let sakit = 0;               // ikut penalti (digabung dgn ijin)
-    let sd = 0;                  // tidak ikut penalti
+    let sakit = 0;             // penalti (gabung dgn ijin)
+    let sd = 0;                // SICK_WITH_CERT (tanpa penalti)
     let terlambatHari = 0;
-    let totalAbsenLengkap = 0;   // lengkap tanpa leave (semua hari dalam rentang)
+    let totalKehadiranHari = 0; // ✅ hadir lengkap = ada check-in & check-out (meski ada leave)
 
     // iterasi per hari dalam [startDate .. effectiveEnd]
     for (let d = startDate; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
       const rec = attMap.get(d);
+      const isWorkday = isWorkdayByLocation(d, user.location_id);
 
-      // total absen lengkap: semua hari (weekend juga), tanpa leave, in & out ada, in ≠ '00:00'
-      if (rec && !rec.leave_request_id && rec.check_in_time && rec.check_out_time && rec.check_in_time !== '00:00') {
-        totalAbsenLengkap += 1;
+      // ✅ kehadiran hari (lengkap) — dua jam ada, meski ada leave
+      if (rec && !isEmptyTime(rec.check_in_time) && !isEmptyTime(rec.check_out_time)) {
+        totalKehadiranHari += 1;
       }
 
-      // penalti: hanya hari kerja
-      if (!isWeekendDate(d)) {
-        if (!rec) {
-          alpa += 1;
-        } else if (rec.leave_request_id) {
-          if (rec.leave_type === 'SICK_NO_CERT') {
-            sakit += 1; // dihitung ke komponen ijin+sakit
-          } else if (rec.leave_type === 'SICK_WITH_CERT') {
-            sd += 1;    // tidak dihitung penalti
-          } else if (['PLANNED_ABSENCE','UNPLANNED_ABSENCE','LEAVE_WORKPLACE'].includes(rec.leave_type)) {
-            ijin += 1;  // dihitung penalti
+      // penalti hanya untuk hari kerja
+      if (!isWorkday) continue;
+
+      if (!rec) {
+        alpa += 1;
+        continue;
+      }
+
+      const hasIn  = !isEmptyTime(rec.check_in_time);
+      const hasOut = !isEmptyTime(rec.check_out_time);
+
+      if (rec.leave_request_id) {
+        const lt = rec.leave_type;
+
+        // PLANNED + DINAS LUAR → hadir bila dua jam ada; kalau tidak, hitung Izin
+        if (lt === 'PLANNED_ABSENCE' && hasDinasLuar(rec.reason)) {
+          if (hasIn && hasOut) {
+            // hadir, tanpa penalti
+          } else {
+            ijin += 1;
           }
-        } else {
-          const hasIn  = !!rec.check_in_time;
-          const hasOut = !!rec.check_out_time;
-          if ((hasIn && !hasOut) || (!hasIn && hasOut)) {
-            tidakLengkap += 1;
-          }
-          if (lateSet.has(d)) {
-            terlambatHari += 1;
-          }
+          continue;
         }
+
+        // LATE/EARLY (OFFSITE juga) → tanpa penalti (tidak-lengkap/telat)
+        if (lt === 'LATE_ARRIVAL' || lt === 'LATE_ARRIVAL_OFFSITE' ||
+            lt === 'EARLY_DEPARTURE' || lt === 'EARLY_DEPARTURE_OFFSITE') {
+          // tidak menambah apapun
+          continue;
+        }
+
+        // leave lain
+        if (lt === 'SICK_NO_CERT')       sakit += 1;
+        else if (lt === 'SICK_WITH_CERT') sd += 1;
+        else if (['PLANNED_ABSENCE','UNPLANNED_ABSENCE','LEAVE_WORKPLACE'].includes(lt)) ijin += 1;
+
+        continue;
+      }
+
+      // TANPA LEAVE: cek tidak lengkap & telat
+      if ((hasIn && !hasOut) || (!hasIn && hasOut)) {
+        tidakLengkap += 1;
+      }
+
+      const diffSec = lateMap.get(d);
+      if (diffSec != null && diffSec > 180) {
+        terlambatHari += 1;
       }
     }
 
-    // === komponen nilai persis Excel + ROUND(...,0)
+    // === komponen nilai + ROUND(...,0)
     const komponen =
       (scoreFromCount(tidakLengkap) * 0.30) +
       (scoreFromCount(ijin + sakit) * 0.40) +
@@ -489,7 +521,7 @@ exports.getNilaiGrade = async (req, res) => {
     else if (nilai >= 30 && nilai <= 49) grade = "D";
     else if (nilai <= 29) grade = "E";
 
-    // === ambil jam absen pada tanggal end_effective (untuk success screen)
+    // jam absen pada end_effective
     const [[todayAtt]] = await db.query(
       `SELECT 
          TIME_FORMAT(check_in_time,'%H:%i')  AS check_in_time,
@@ -508,15 +540,13 @@ exports.getNilaiGrade = async (req, res) => {
       periode: { start: startDate, end: endDate, end_effective: effectiveEnd },
       nilai,
       grade,
-      total_absen_lengkap: totalAbsenLengkap,
-      total_izin: ijin,                 // PLANNED/UNPLANNED/LW pada hari kerja
-      total_telat: terlambatHari,       // hari kerja, >3 menit
+      total_absen_lengkap: totalKehadiranHari, // ✅ sekarang = dua jam ada (meski ada leave)
+      total_izin: ijin,                        // PLANNED/UNPLANNED/LW (+ PLANNED+DL tanpa dua jam)
+      total_telat: terlambatHari,              // hari kerja, >3 menit
       total_tidak_lengkap: tidakLengkap,
-      total_alpa: alpa,                 // 👈 tambahan yang diminta
-      // alias opsional agar tidak rancu "alpha" vs "alpa": uncomment kalau mau
-      // total_alpha: alpa,
-      absen_datang: absenDatang,        // 👈 jam HH:mm pada end_effective (kalau ada)
-      absen_pulang: absenPulang         // 👈 jam HH:mm pada end_effective (kalau ada)
+      total_alpa: alpa,
+      absen_datang: absenDatang,
+      absen_pulang: absenPulang
     });
   } catch (err) {
     console.error(err);
