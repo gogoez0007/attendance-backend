@@ -348,8 +348,9 @@ exports.getNilaiGrade = async (req, res) => {
     const day = d.getDay(); // 0=Min,6=Sab
     return day === 0 || day === 6;
   };
-  const isWorkdayByLocation = (dateStr, locationId) => {
-    return Number(locationId) === 1 ? !isWeekend(dateStr) : true;
+  const isWorkdayByLocation = (dateObj, locationId, specialIds = [1, 5]) => {
+    const id = Number(locationId);
+    return specialIds.includes(id) ? !isWeekend(dateObj) : true;
   };
   const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
   const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
