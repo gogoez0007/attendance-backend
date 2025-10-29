@@ -330,227 +330,447 @@ exports.handleAttendance = async (req, res) => {
   }
 };
 
-// ✅ Nilai & Grade (rumus Excel) + ringkasan + total_alpa + absen_datang/pulang (di end_effective)
+// controllers/nilaiGrade.controller.js
+// Catatan: asumsi ada koneksi DB: const db = require('../db'); atau serupa.
+const HttpError = class extends Error { constructor(status, message){ super(message); this.status = status; } };
+
+// ==== Util umum ====
+const addDays = (dateStr, n) => {
+  const d = new Date(`${dateStr}T00:00:00`);
+  d.setDate(d.getDate() + n);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+};
+const cmpDate = (a, b) => (a === b ? 0 : (a < b ? -1 : 1));
+const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00`).getTime());
+const isWeekend = (dateStr) => {
+  const d = new Date(`${dateStr}T00:00:00`);
+  const day = d.getDay(); // 0=Min,6=Sab
+  return day === 0 || day === 6;
+};
+const isWorkdayByLocation = (dateObj, locationId, specialIds = [1, 5]) => {
+  const id = Number(locationId);
+  return specialIds.includes(id) ? !isWeekend(dateObj) : true;
+};
+const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
+const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
+
+// bucket skor ala Excel
+const scoreFromCount = (n) => (n >= 5 ? 0 : n === 4 ? 20 : n === 3 ? 40 : n === 2 ? 60 : n === 1 ? 80 : 100);
+const alpaFactor     = (n) => (n >= 5 ? 0.0 : n === 4 ? 0.2 : n === 3 ? 0.4 : n === 2 ? 0.6 : n === 1 ? 0.8 : 1.0);
+
+// ===== Inti perhitungan: kembalikan payload siap pakai =====
+async function computeNilaiGradePayload(req, db) {
+  const { user_id } = req.query;
+  let { start_date, end_date, start, end, bulan, tahun } = req.query;
+
+  // normalisasi alias param
+  start_date = (start_date || start || '').trim();
+  end_date   = (end_date   || end   || '').trim();
+
+  // validasi user
+  const userIdInt = Number(user_id);
+  if (!Number.isInteger(userIdInt)) {
+    throw new HttpError(400, "Param wajib: user_id harus angka");
+  }
+
+  // ambil user
+  const [[user]] = await db.query('SELECT id, shift_id, location_id FROM users WHERE id = ? LIMIT 1', [userIdInt]);
+  if (!user) throw new HttpError(404, 'User tidak ditemukan.');
+
+  // tentukan rentang tanggal
+  let startDate, endDate;
+  if (start_date && end_date) {
+    if (!isValidYMD(start_date) || !isValidYMD(end_date)) {
+      throw new HttpError(400, "Format tanggal harus YYYY-MM-DD (start_date & end_date)");
+    }
+    if (cmpDate(start_date, end_date) === 1) {
+      throw new HttpError(400, "start_date tidak boleh lebih besar dari end_date");
+    }
+    startDate = start_date;
+    endDate   = end_date;
+  } else {
+    const monthNum = Number(bulan);
+    const yearNum  = Number(tahun);
+    if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12 ||
+        !Number.isInteger(yearNum) || String(tahun || '').length !== 4) {
+      throw new HttpError(400, "Gunakan start_date & end_date (YYYY-MM-DD), atau bulan=1-12 & tahun=YYYY");
+    }
+    const daysInMonth = new Date(yearNum, monthNum, 0).getDate();
+    startDate = `${yearNum}-${String(monthNum).padStart(2, "0")}-01`;
+    endDate   = `${yearNum}-${String(monthNum).padStart(2, "0")}-${String(daysInMonth).padStart(2, "0")}`;
+  }
+
+  // clamp endDate ke hari ini supaya hari depan tidak dihitung ALPA
+  const today = new Date();
+  const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+  const effectiveEnd = (cmpDate(endDate, todayStr) === 1) ? todayStr : endDate;
+
+  // ambil attendance & leave dalam rentang efektif
+  const [attendance] = await db.query(
+    `SELECT 
+       DATE_FORMAT(a.date,'%Y-%m-%d')         AS date,
+       TIME_FORMAT(a.check_in_time,'%H:%i')   AS check_in_time,
+       TIME_FORMAT(a.check_out_time,'%H:%i')  AS check_out_time,
+       a.leave_request_id,
+       lr.leave_type,
+       lr.reason
+     FROM attendance a
+     LEFT JOIN leave_requests lr ON lr.id = a.leave_request_id
+     WHERE a.user_id = ? AND a.date BETWEEN ? AND ?`,
+    [userIdInt, startDate, effectiveEnd]
+  );
+  const attMap = new Map(attendance.map(r => [r.date, r]));
+
+  // telat > 3 menit (pakai default shift user)
+  const [lateRows] = await db.query(
+    `SELECT 
+       DATE_FORMAT(a.date,'%Y-%m-%d') AS date,
+       TIMESTAMPDIFF(SECOND, s.start_time, a.check_in_time) AS diff_sec
+     FROM attendance a
+     JOIN users u  ON u.id = a.user_id
+     LEFT JOIN shifts s ON s.id = u.shift_id
+     WHERE a.user_id = ?
+       AND a.date BETWEEN ? AND ?
+       AND a.check_in_time IS NOT NULL`,
+    [userIdInt, startDate, effectiveEnd]
+  );
+  const lateMap = new Map(lateRows.map(r => [r.date, r.diff_sec]));
+
+  // ===== agregasi =====
+  let tidakLengkap = 0;
+  let alpa = 0;              // total_alpa
+  let ijin = 0;
+  let sakit = 0;             // penalti (gabung dgn ijin)
+  let sd = 0;                // SICK_WITH_CERT (tanpa penalti)
+  let terlambatHari = 0;
+  let totalKehadiranHari = 0; // hadir lengkap = ada check-in & check-out (meski ada leave)
+
+  // iterasi harian
+  for (let d = startDate; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
+    const rec = attMap.get(d);
+    const isWorkday = isWorkdayByLocation(d, user.location_id);
+
+    // hadir lengkap (dua jam ada), meski ada leave
+    if (rec && !isEmptyTime(rec.check_in_time) && !isEmptyTime(rec.check_out_time)) {
+      totalKehadiranHari += 1;
+    }
+
+    // penalti hanya untuk hari kerja
+    if (!isWorkday) continue;
+
+    if (!rec) {
+      alpa += 1;
+      continue;
+    }
+
+    const hasIn  = !isEmptyTime(rec.check_in_time);
+    const hasOut = !isEmptyTime(rec.check_out_time);
+
+    if (rec.leave_request_id) {
+      const lt = rec.leave_type;
+
+      // PLANNED + DINAS LUAR → hadir bila dua jam ada; kalau tidak, hitung Izin
+      if (lt === 'PLANNED_ABSENCE' && hasDinasLuar(rec.reason)) {
+        if (hasIn && hasOut) {
+          // hadir, tanpa penalti
+        } else {
+          ijin += 1;
+        }
+        continue;
+      }
+
+      // LATE/EARLY (OFFSITE juga) → tanpa penalti (tidak-lengkap/telat)
+      if (lt === 'LATE_ARRIVAL' || lt === 'LATE_ARRIVAL_OFFSITE' ||
+          lt === 'EARLY_DEPARTURE' || lt === 'EARLY_DEPARTURE_OFFSITE') {
+        continue;
+      }
+
+      // leave lain
+      if (lt === 'SICK_NO_CERT')       sakit += 1;
+      else if (lt === 'SICK_WITH_CERT') sd += 1;
+      else if (['PLANNED_ABSENCE','UNPLANNED_ABSENCE','LEAVE_WORKPLACE'].includes(lt)) ijin += 1;
+
+      continue;
+    }
+
+    // TANPA LEAVE: cek tidak lengkap & telat
+    if ((hasIn && !hasOut) || (!hasIn && hasOut)) {
+      tidakLengkap += 1;
+    }
+
+    const diffSec = lateMap.get(d);
+    if (diffSec != null && diffSec > 180) {
+      terlambatHari += 1;
+    }
+  }
+
+  // komponen nilai
+  const komponen =
+    (scoreFromCount(tidakLengkap) * 0.30) +
+    (scoreFromCount(ijin + sakit) * 0.40) +   // sd tidak dipenalti
+    (scoreFromCount(terlambatHari) * 0.30);
+
+  const nilai = Math.round(komponen * alpaFactor(alpa));
+
+  // Grade
+  let grade = "";
+  if (nilai >= 90) grade = "A";
+  else if (nilai >= 70 && nilai <= 89) grade = "B";
+  else if (nilai >= 50 && nilai <= 69) grade = "C";
+  else if (nilai >= 30 && nilai <= 49) grade = "D";
+  else if (nilai <= 29) grade = "E";
+
+  // jam absen pada end_effective
+  const [[todayAtt]] = await db.query(
+    `SELECT 
+       TIME_FORMAT(check_in_time,'%H:%i')  AS check_in_time,
+       TIME_FORMAT(check_out_time,'%H:%i') AS check_out_time
+     FROM attendance
+     WHERE user_id = ? AND date = ?
+     LIMIT 1`,
+    [userIdInt, effectiveEnd]
+  );
+
+  const absenDatang = todayAtt?.check_in_time || null;
+  const absenPulang = todayAtt?.check_out_time || null;
+
+  // total sakit (gabungan sakit tanpa surat + sakit dengan surat dokter)
+  const totalSakit = sakit + sd;
+
+  return {
+    periode: { start: startDate, end: endDate, end_effective: effectiveEnd },
+    nilai,
+    grade,
+    total_absen_lengkap: totalKehadiranHari,
+    total_izin: ijin,
+    total_telat: terlambatHari,
+    total_tidak_lengkap: tidakLengkap,
+    total_alpa: alpa,
+    total_sakit: totalSakit,
+    // detail opsional:
+    // total_sakit_tanpa_surat: sakit,
+    // total_sakit_dengan_surat: sd,
+    absen_datang: absenDatang,
+    absen_pulang: absenPulang
+  };
+}
+
+// ====== Endpoint JSON (tetap ada) ======
 exports.getNilaiGrade = async (req, res) => {
-  // helper tanggal
-  const addDays = (dateStr, n) => {
-    const d = new Date(`${dateStr}T00:00:00`);
-    d.setDate(d.getDate() + n);
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${dd}`;
-  };
-  const cmpDate = (a, b) => (a === b ? 0 : (a < b ? -1 : 1));
-  const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00`).getTime());
-  const isWeekend = (dateStr) => {
-    const d = new Date(`${dateStr}T00:00:00`);
-    const day = d.getDay(); // 0=Min,6=Sab
-    return day === 0 || day === 6;
-  };
-  const isWorkdayByLocation = (dateObj, locationId, specialIds = [1, 5]) => {
-    const id = Number(locationId);
-    return specialIds.includes(id) ? !isWeekend(dateObj) : true;
-  };
-  const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
-  const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
-
-  // bucket skor ala Excel
-  const scoreFromCount = (n) => (n >= 5 ? 0 : n === 4 ? 20 : n === 3 ? 40 : n === 2 ? 60 : n === 1 ? 80 : 100);
-  const alpaFactor     = (n) => (n >= 5 ? 0.0 : n === 4 ? 0.2 : n === 3 ? 0.4 : n === 2 ? 0.6 : n === 1 ? 0.8 : 1.0);
-
   try {
-    const { user_id } = req.query;
-    let { start_date, end_date, start, end, bulan, tahun } = req.query;
-
-    // normalisasi alias param
-    start_date = (start_date || start || '').trim();
-    end_date   = (end_date   || end   || '').trim();
-
-    // validasi user
-    const userIdInt = Number(user_id);
-    if (!Number.isInteger(userIdInt)) {
-      return res.status(400).json({ error: "Param wajib: user_id harus angka" });
-    }
-    // butuh location_id untuk aturan weekend
-    const [[user]] = await db.query('SELECT id, shift_id, location_id FROM users WHERE id = ? LIMIT 1', [userIdInt]);
-    if (!user) return res.status(404).json({ error: 'User tidak ditemukan.' });
-
-    // tentukan rentang tanggal
-    let startDate, endDate;
-    if (start_date && end_date) {
-      if (!isValidYMD(start_date) || !isValidYMD(end_date)) {
-        return res.status(400).json({ error: "Format tanggal harus YYYY-MM-DD (start_date & end_date)" });
-      }
-      if (cmpDate(start_date, end_date) === 1) {
-        return res.status(400).json({ error: "start_date tidak boleh lebih besar dari end_date" });
-      }
-      startDate = start_date;
-      endDate   = end_date;
-    } else {
-      const monthNum = Number(bulan);
-      const yearNum  = Number(tahun);
-      if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12 ||
-          !Number.isInteger(yearNum) || String(tahun || '').length !== 4) {
-        return res.status(400).json({
-          error: "Gunakan start_date & end_date (YYYY-MM-DD), atau bulan=1-12 & tahun=YYYY"
-        });
-      }
-      const daysInMonth = new Date(yearNum, monthNum, 0).getDate();
-      startDate = `${yearNum}-${String(monthNum).padStart(2, "0")}-01`;
-      endDate   = `${yearNum}-${String(monthNum).padStart(2, "0")}-${String(daysInMonth).padStart(2, "0")}`;
-    }
-
-    // clamp endDate ke hari ini supaya hari depan tidak dihitung ALPA
-    const today = new Date();
-    const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
-    const effectiveEnd = (cmpDate(endDate, todayStr) === 1) ? todayStr : endDate;
-
-    // ambil attendance & leave HANYA dalam rentang efektif
-    const [attendance] = await db.query(
-      `SELECT 
-         DATE_FORMAT(a.date,'%Y-%m-%d')         AS date,
-         TIME_FORMAT(a.check_in_time,'%H:%i')   AS check_in_time,
-         TIME_FORMAT(a.check_out_time,'%H:%i')  AS check_out_time,
-         a.leave_request_id,
-         lr.leave_type,
-         lr.reason
-       FROM attendance a
-       LEFT JOIN leave_requests lr ON lr.id = a.leave_request_id
-       WHERE a.user_id = ? AND a.date BETWEEN ? AND ?`,
-      [userIdInt, startDate, effectiveEnd]
-    );
-    const attMap = new Map(attendance.map(r => [r.date, r]));
-
-    // telat > 3 menit (pakai default shift user)
-    const [lateRows] = await db.query(
-      `SELECT 
-         DATE_FORMAT(a.date,'%Y-%m-%d') AS date,
-         TIMESTAMPDIFF(SECOND, s.start_time, a.check_in_time) AS diff_sec
-       FROM attendance a
-       JOIN users u  ON u.id = a.user_id
-       LEFT JOIN shifts s ON s.id = u.shift_id
-       WHERE a.user_id = ?
-         AND a.date BETWEEN ? AND ?
-         AND a.check_in_time IS NOT NULL`,
-      [userIdInt, startDate, effectiveEnd]
-    );
-    const lateMap = new Map(lateRows.map(r => [r.date, r.diff_sec]));
-
-    // ===== agregasi =====
-    let tidakLengkap = 0;
-    let alpa = 0;              // total_alpa
-    let ijin = 0;
-    let sakit = 0;             // penalti (gabung dgn ijin)
-    let sd = 0;                // SICK_WITH_CERT (tanpa penalti)
-    let terlambatHari = 0;
-    let totalKehadiranHari = 0; // ✅ hadir lengkap = ada check-in & check-out (meski ada leave)
-
-    // iterasi per hari dalam [startDate .. effectiveEnd]
-    for (let d = startDate; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
-      const rec = attMap.get(d);
-      const isWorkday = isWorkdayByLocation(d, user.location_id);
-
-      // ✅ kehadiran hari (lengkap) — dua jam ada, meski ada leave
-      if (rec && !isEmptyTime(rec.check_in_time) && !isEmptyTime(rec.check_out_time)) {
-        totalKehadiranHari += 1;
-      }
-
-      // penalti hanya untuk hari kerja
-      if (!isWorkday) continue;
-
-      if (!rec) {
-        alpa += 1;
-        continue;
-      }
-
-      const hasIn  = !isEmptyTime(rec.check_in_time);
-      const hasOut = !isEmptyTime(rec.check_out_time);
-
-      if (rec.leave_request_id) {
-        const lt = rec.leave_type;
-
-        // PLANNED + DINAS LUAR → hadir bila dua jam ada; kalau tidak, hitung Izin
-        if (lt === 'PLANNED_ABSENCE' && hasDinasLuar(rec.reason)) {
-          if (hasIn && hasOut) {
-            // hadir, tanpa penalti
-          } else {
-            ijin += 1;
-          }
-          continue;
-        }
-
-        // LATE/EARLY (OFFSITE juga) → tanpa penalti (tidak-lengkap/telat)
-        if (lt === 'LATE_ARRIVAL' || lt === 'LATE_ARRIVAL_OFFSITE' ||
-            lt === 'EARLY_DEPARTURE' || lt === 'EARLY_DEPARTURE_OFFSITE') {
-          // tidak menambah apapun
-          continue;
-        }
-
-        // leave lain
-        if (lt === 'SICK_NO_CERT')       sakit += 1;
-        else if (lt === 'SICK_WITH_CERT') sd += 1;
-        else if (['PLANNED_ABSENCE','UNPLANNED_ABSENCE','LEAVE_WORKPLACE'].includes(lt)) ijin += 1;
-
-        continue;
-      }
-
-      // TANPA LEAVE: cek tidak lengkap & telat
-      if ((hasIn && !hasOut) || (!hasIn && hasOut)) {
-        tidakLengkap += 1;
-      }
-
-      const diffSec = lateMap.get(d);
-      if (diffSec != null && diffSec > 180) {
-        terlambatHari += 1;
-      }
-    }
-
-    // === komponen nilai + ROUND(...,0)
-    const komponen =
-      (scoreFromCount(tidakLengkap) * 0.30) +
-      (scoreFromCount(ijin + sakit) * 0.40) +
-      (scoreFromCount(terlambatHari) * 0.30);
-
-    const nilai = Math.round(komponen * alpaFactor(alpa));
-
-    // Grade
-    let grade = "";
-    if (nilai >= 90) grade = "A";
-    else if (nilai >= 70 && nilai <= 89) grade = "B";
-    else if (nilai >= 50 && nilai <= 69) grade = "C";
-    else if (nilai >= 30 && nilai <= 49) grade = "D";
-    else if (nilai <= 29) grade = "E";
-
-    // jam absen pada end_effective
-    const [[todayAtt]] = await db.query(
-      `SELECT 
-         TIME_FORMAT(check_in_time,'%H:%i')  AS check_in_time,
-         TIME_FORMAT(check_out_time,'%H:%i') AS check_out_time
-       FROM attendance
-       WHERE user_id = ? AND date = ?
-       LIMIT 1`,
-      [userIdInt, effectiveEnd]
-    );
-
-    const absenDatang = todayAtt?.check_in_time || null;
-    const absenPulang = todayAtt?.check_out_time || null;
-
-    // respons
-    return res.json({
-      periode: { start: startDate, end: endDate, end_effective: effectiveEnd },
-      nilai,
-      grade,
-      total_absen_lengkap: totalKehadiranHari, // ✅ sekarang = dua jam ada (meski ada leave)
-      total_izin: ijin,                        // PLANNED/UNPLANNED/LW (+ PLANNED+DL tanpa dua jam)
-      total_telat: terlambatHari,              // hari kerja, >3 menit
-      total_tidak_lengkap: tidakLengkap,
-      total_alpa: alpa,
-      absen_datang: absenDatang,
-      absen_pulang: absenPulang
-    });
+    const payload = await computeNilaiGradePayload(req, db);
+    return res.json(payload);
   } catch (err) {
     console.error(err);
+    if (err instanceof HttpError) {
+      return res.status(err.status).json({ error: err.message });
+    }
     return res.status(500).json({ error: "Terjadi kesalahan server: " + err.message });
+  }
+};
+// ====== Endpoint HTML Mobile (kompak + KPI 2 kolom, cocok WebView) ======
+exports.getNilaiGradeHtml = async (req, res) => {
+  try {
+    const data = await computeNilaiGradePayload(req, db);
+
+    // helper
+    const escapeHtml = (s) =>
+      String(s ?? '').replace(/[&<>"']/g, ch => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]
+      ));
+    const num = (v) => Number(v ?? 0);
+
+    // total_sakit fallback (kalau payload lama)
+    const totalSakit = num(data.total_sakit != null
+      ? data.total_sakit
+      : (data.sakit || 0) + (data.sd || 0));
+
+    // palet sesuai grade
+    const pal = {
+      A: { start:'#34d399', end:'#10b981', tint:'#86efac' }, // emerald
+      B: { start:'#60a5fa', end:'#3b82f6', tint:'#93c5fd' }, // blue
+      C: { start:'#fbbf24', end:'#f59e0b', tint:'#fde68a' }, // amber
+      D: { start:'#fb923c', end:'#f97316', tint:'#fdba74' }, // orange
+      E: { start:'#f87171', end:'#ef4444', tint:'#fca5a5' }, // red
+    }[data.grade || 'E'];
+
+    const nilai = Math.max(0, Math.min(100, Number(data.nilai || 0)));
+
+    const html = `<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ringkasan Absensi</title>
+<meta name="theme-color" content="${pal.end}">
+<style>
+  :root{
+    --accent-start:${pal.start};
+    --accent-end:${pal.end};
+    --accent-tint:${pal.tint};
+    --bg:#0b1020;
+    --card:#0f172acc;
+    --line:#ffffff22;
+    --text:#e5e7eb;
+    --muted:#9ca3af;
+    --space:10px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Inter, Roboto, Arial;
+    color:var(--text);
+    background:
+      radial-gradient(900px 520px at -10% -10%, #06b6d4 0%, transparent 60%),
+      radial-gradient(800px 480px at 50% 120%, #7c3aed 0%, transparent 60%),
+      var(--bg);
+    -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+  }
+  .wrap{max-width:560px;margin:0 auto;padding:clamp(10px,4vw,16px)}
+
+  /* kartu utama kompak */
+  .summary{
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:16px;
+    padding:12px;
+    box-shadow:0 10px 28px rgba(0,0,0,.32), inset 0 0 0 1px rgba(255,255,255,.07);
+    backdrop-filter: blur(6px);
+  }
+
+  /* periode pills (ringkas) */
+  .pills{ display:flex; flex-wrap:wrap; gap:6px; margin:0 0 var(--space) }
+  .pill{
+    display:inline-flex; align-items:center; gap:6px;
+    border-radius:999px; padding:5px 8px;
+    border:1px dashed rgba(255,255,255,.24);
+    background: rgba(255,255,255,.06);
+    color:#dbeafe; font-size:.82rem;
+  }
+
+  /* hero (progress ring + grade) */
+  .hero{ display:grid; gap:8px; grid-template-columns:1fr; margin-bottom:var(--space) }
+  .ring{
+    display:flex; align-items:center; gap:12px;
+    background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:14px; padding:10px;
+  }
+  .ring-outer{
+    --size:84px; width:var(--size); height:var(--size); border-radius:50%;
+    background:conic-gradient(var(--accent-start) ${nilai*3.6}deg, rgba(255,255,255,.17) 0deg 360deg);
+    display:grid; place-items:center;
+    box-shadow:0 8px 20px rgba(0,0,0,.25), inset 0 0 0 1px rgba(255,255,255,.18);
+  }
+  .ring-inner{
+    width:calc(100% - 14px); height:calc(100% - 14px); border-radius:50%;
+    background:rgba(7,12,28,.9); color:#fff; display:grid; place-items:center;
+    font-weight:900; font-size:1.1rem; text-shadow:0 1px 2px rgba(0,0,0,.25);
+  }
+  .grade-badge{
+    display:inline-grid; place-items:center;
+    min-width:42px; height:28px; padding:0 8px; border-radius:9px;
+    background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
+    color:#06121a; font-weight:900; border:1px solid rgba(255,255,255,.24); font-size:.95rem;
+  }
+  .hero-note{ font-size:.85rem; color:var(--muted); margin-top:4px }
+
+  /* KPI grid: 2 kolom SELALU */
+  .grid{
+    display:grid; gap:8px; grid-template-columns: 1fr 1fr;
+  }
+  .kpi{
+    background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:12px; padding:10px;
+    display:flex; align-items:center; gap:10px; min-height:54px;
+  }
+  .kpi .i{
+    width:32px; height:32px; flex:0 0 32px;
+    display:grid; place-items:center; border-radius:9px;
+    color:#0a1220;
+    background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
+    box-shadow: 0 6px 12px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,255,255,.16);
+    font-size:17px;
+  }
+  .kpi b{ font-size:1.1rem; line-height:1 }
+  .kpi .label{ color:var(--muted); font-size:.8rem; margin-top:2px; line-height:1.1 }
+
+  /* detail list ringkas (2 kolom agar pendek) */
+  .list{ margin-top:var(--space); display:grid; gap:8px; grid-template-columns: 1fr 1fr }
+  .row{
+    display:flex; justify-content:space-between; align-items:center; gap:10px;
+    background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:10px; padding:8px 10px; min-height:46px;
+  }
+  .left{ display:flex; flex-direction:column; }
+  .left small{ color:var(--muted); font-size:.78rem }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="summary" aria-label="Ringkasan Absensi">
+      <!-- PERIODE -->
+      <div class="pills">
+        <span class="pill">📅 ${escapeHtml(data.periode.start)} → ${escapeHtml(data.periode.end)}</span>
+        <span class="pill">⏱️ s.d. ${escapeHtml(data.periode.end_effective)}</span>
+      </div>
+
+      <!-- HERO -->
+      <div class="hero">
+        <div class="ring">
+          <div class="ring-outer" role="img" aria-label="Nilai ${nilai} dari 100">
+            <div class="ring-inner">${nilai}<small>/100</small></div>
+          </div>
+          <div>
+            <div style="font-size:.85rem;color:var(--muted)">Grade</div>
+            <div class="grade-badge">${escapeHtml(data.grade)}</div>
+            <div class="hero-note">Performa periode ini</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- KPI GRID (2 kolom) -->
+      <div class="grid" aria-label="KPI Periode">
+        <div class="kpi"><div class="i">✅</div><div><b>${num(data.total_absen_lengkap)}</b><div class="label">Hadir Lengkap</div></div></div>
+        <div class="kpi"><div class="i">⏰</div><div><b>${num(data.total_telat)}</b><div class="label">Telat (&gt;3 menit)</div></div></div>
+        <div class="kpi"><div class="i">🟡</div><div><b>${num(data.total_tidak_lengkap)}</b><div class="label">Tidak Lengkap</div></div></div>
+        <div class="kpi"><div class="i">📄</div><div><b>${num(data.total_izin)}</b><div class="label">Izin</div></div></div>
+        <div class="kpi"><div class="i">❌</div><div><b>${num(data.total_alpa)}</b><div class="label">Alpa</div></div></div>
+        <div class="kpi"><div class="i">🤒</div><div><b>${totalSakit}</b><div class="label">Sakit (Total)</div></div></div>
+      </div>
+
+      <!-- DETAIL (2 kolom agar pendek) -->
+      <div class="list" aria-label="Detail Tambahan">
+        <div class="row"><div class="left"><b>Absen Datang</b><small>Per ${escapeHtml(data.periode.end_effective)}</small></div><div><b>${data.absen_datang ? escapeHtml(data.absen_datang) : '-'}</b></div></div>
+        <div class="row"><div class="left"><b>Absen Pulang</b><small>Per ${escapeHtml(data.periode.end_effective)}</small></div><div><b>${data.absen_pulang ? escapeHtml(data.absen_pulang) : '-'}</b></div></div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>`;
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    return res.send(html);
+
+  } catch (err) {
+    console.error(err);
+    const escapeHtml = (s) =>
+      String(s ?? '').replace(/[&<>"']/g, ch => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]
+      ));
+    const msg = err?.message || ("Terjadi kesalahan server: " + err);
+    res
+      .status(err?.status || 500)
+      .send(`<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body{font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px;background:#0b1020;color:#e5e7eb}
+        .box{max-width:560px;margin:0 auto;background:#111827aa;border:1px solid #ffffff22;border-radius:16px;padding:18px}
+        h1{margin:0 0 8px 0}.muted{color:#9ca3af}a{color:#93c5fd}
+      </style>
+      <div class="box"><h1>Gagal memuat</h1><div class="muted">${escapeHtml(msg)}</div><p><a href="javascript:history.back()">Kembali</a></p></div>`);
   }
 };

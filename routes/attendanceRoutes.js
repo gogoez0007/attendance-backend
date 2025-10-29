@@ -3,6 +3,7 @@ const router = express.Router();
 const attendanceController = require('../controllers/attendanceController');
 
 router.get('/get_grade', attendanceController.getNilaiGrade);
+router.get('/get_grade_html', attendanceController.getNilaiGradeHtml);
 
 router.get('/', attendanceController.getAttendances);
 router.get('/:id', attendanceController.getAttendanceById);
