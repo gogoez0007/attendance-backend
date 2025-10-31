@@ -345,14 +345,33 @@ const addDays = (dateStr, n) => {
 };
 const cmpDate = (a, b) => (a === b ? 0 : (a < b ? -1 : 1));
 const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00`).getTime());
-const isWeekend = (dateStr) => {
-  const d = new Date(`${dateStr}T00:00:00`);
+function asDate(dateLike) {
+  if (dateLike instanceof Date) return new Date(dateLike.getFullYear(), dateLike.getMonth(), dateLike.getDate());
+  if (typeof dateLike === 'string') {
+    // parse aman untuk 'YYYY-MM-DD' (hindari offset timezone)
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(dateLike);
+    if (m) {
+      const y = +m[1], mo = +m[2], da = +m[3];
+      return new Date(y, mo - 1, da); // local 00:00
+    }
+    const d = new Date(dateLike);
+    if (!Number.isNaN(d.getTime())) return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }
+  return new Date('invalid'); // biar ketahuan saat logging
+}
+const isWeekend = (dateLike) => {
+  const d = asDate(dateLike);
   const day = d.getDay(); // 0=Min,6=Sab
+  // console.log(`isWeekend: date=${toYMD(d)}, day=${day}`);
   return day === 0 || day === 6;
 };
-const isWorkdayByLocation = (dateObj, locationId, specialIds = [1, 5]) => {
-  const id = Number(locationId);
-  return specialIds.includes(id) ? !isWeekend(dateObj) : true;
+
+const isWorkdayByLocation = (dateLike, locationId, specialIds = [1, 5]) => {
+  const d = asDate(dateLike);
+  const weekend = isWeekend(d);
+  // console.log(`isWorkdayByLocation: locationId=${locationId}, date=${toYMD(d)}, isWeekend=${weekend}`);
+  // lokasi "spesial" hanya kerja Sen–Jum; lainnya selalu kerja
+  return specialIds.includes(Number(locationId)) ? !weekend : true;
 };
 const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
 const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
@@ -439,6 +458,16 @@ async function computeNilaiGradePayload(req, db) {
   );
   const lateMap = new Map(lateRows.map(r => [r.date, r.diff_sec]));
 
+  // ====== HARI LIBUR (LN/CB) ======
+  // tarik daftar libur & index-kan per tanggal agar penalti SKIP di hari libur
+  const [holidayRows] = await db.query(
+    `SELECT DATE_FORMAT(tanggal, '%Y-%m-%d') AS date
+       FROM hari_libur
+      WHERE tanggal BETWEEN ? AND ?`,
+    [startDate, effectiveEnd]
+  );
+  const holidaySet = new Set(holidayRows.map(h => h.date)); // e.g. '2025-05-01'
+
   // ===== agregasi =====
   let tidakLengkap = 0;
   let alpa = 0;              // total_alpa
@@ -451,14 +480,18 @@ async function computeNilaiGradePayload(req, db) {
   // iterasi harian
   for (let d = startDate; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
     const rec = attMap.get(d);
-    const isWorkday = isWorkdayByLocation(d, user.location_id);
 
-    // hadir lengkap (dua jam ada), meski ada leave
+    // hadir lengkap (dua jam ada), meski ada leave & meski hari libur
     if (rec && !isEmptyTime(rec.check_in_time) && !isEmptyTime(rec.check_out_time)) {
       totalKehadiranHari += 1;
     }
 
-    // penalti hanya untuk hari kerja
+    // === SKIP penalti pada hari libur ===
+    const dateObj = new Date(`${d}T00:00:00`);
+    const isWorkdayBase = isWorkdayByLocation(dateObj, user.location_id); // fungsi kamu yang lama
+    const isHoliday = holidaySet.has(d);
+    const isWorkday = isWorkdayBase && !isHoliday;
+    // console.log(`Date: ${d}, isWorkdayBase: ${isWorkdayBase}, isHoliday: ${isHoliday}, isWorkday: ${isWorkday}, locationId: ${user.location_id}`);
     if (!isWorkday) continue;
 
     if (!rec) {
@@ -550,13 +583,11 @@ async function computeNilaiGradePayload(req, db) {
     total_tidak_lengkap: tidakLengkap,
     total_alpa: alpa,
     total_sakit: totalSakit,
-    // detail opsional:
-    // total_sakit_tanpa_surat: sakit,
-    // total_sakit_dengan_surat: sd,
     absen_datang: absenDatang,
     absen_pulang: absenPulang
   };
 }
+
 
 // ====== Endpoint JSON (tetap ada) ======
 exports.getNilaiGrade = async (req, res) => {
