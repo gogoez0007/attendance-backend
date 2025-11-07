@@ -1,3 +1,4 @@
+const { json } = require('express');
 const db = require('../db');
 const notificationService = require('../services/notificationService');
 
@@ -366,7 +367,7 @@ const isWeekend = (dateLike) => {
   return day === 0 || day === 6;
 };
 
-const isWorkdayByLocation = (dateLike, locationId, specialIds = [1, 5]) => {
+const isWorkdayByLocation = (dateLike, locationId, specialIds = [1, 5, 12]) => {
   const d = asDate(dateLike);
   const weekend = isWeekend(d);
   // console.log(`isWorkdayByLocation: locationId=${locationId}, date=${toYMD(d)}, isWeekend=${weekend}`);
@@ -493,8 +494,10 @@ async function computeNilaiGradePayload(req, db) {
     const isWorkday = isWorkdayBase && !isHoliday;
     // console.log(`Date: ${d}, isWorkdayBase: ${isWorkdayBase}, isHoliday: ${isHoliday}, isWorkday: ${isWorkday}, locationId: ${user.location_id}`);
     if (!isWorkday) continue;
-
+    // console.log(`Processing date: ${d} (workday)`);
+    // console.log(JSON.stringify(rec, 0, 2));
     if (!rec) {
+      // console.log(rec)
       alpa += 1;
       continue;
     }
