@@ -89,19 +89,6 @@ const makeDateTime = (dateStr, timeStr) => {
   return d;
 };
 
-const addDays = (dateStr, n) => {
-  const d = new Date(`${dateStr}T00:00:00`);
-  d.setDate(d.getDate() + n);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${dd}`;
-};
-
-const cmpDate = (a, b) => (a === b ? 0 : (a < b ? -1 : 1));
-
-const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00`).getTime());
-
 function asDate(dateLike) {
   if (dateLike instanceof Date) {
     return new Date(dateLike.getFullYear(), dateLike.getMonth(), dateLike.getDate());
@@ -127,32 +114,6 @@ function asDate(dateLike) {
   return new Date('invalid');
 }
 
-const isWeekend = (dateLike) => {
-  const d = asDate(dateLike);
-  const day = d.getDay();
-  return day === 0 || day === 6;
-};
-
-const isWorkdayByLocation = (dateLike, locationId, specialIds = [1, 5, 12]) => {
-  const d = asDate(dateLike);
-  const weekend = isWeekend(d);
-  return specialIds.includes(Number(locationId)) ? !weekend : true;
-};
-
-const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
-
-const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
-
-const scoreFromCount = (n) => (n >= 5 ? 0 : n === 4 ? 20 : n === 3 ? 40 : n === 2 ? 60 : n === 1 ? 80 : 100);
-
-const alpaFactor = (n) => (n >= 5 ? 0.0 : n === 4 ? 0.2 : n === 3 ? 0.4 : n === 2 ? 0.6 : n === 1 ? 0.8 : 1.0);
-
-const HttpError = class extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-};
 
 async function getEffectiveShift(db, user_id, schedule_date, defaultShiftId) {
   const [[sch]] = await db.query(
