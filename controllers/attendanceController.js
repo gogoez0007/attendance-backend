@@ -428,6 +428,58 @@ exports.handleAttendance = async (req, res) => {
   }
 };
 
+
+// controllers/nilaiGrade.controller.js
+// Catatan: asumsi ada koneksi DB: const db = require('../db'); atau serupa.
+const HttpError = class extends Error { constructor(status, message){ super(message); this.status = status; } };
+
+// ==== Util umum ====
+const addDays = (dateStr, n) => {
+  const d = new Date(`${dateStr}T00:00:00`);
+  d.setDate(d.getDate() + n);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+};
+const cmpDate = (a, b) => (a === b ? 0 : (a < b ? -1 : 1));
+const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00`).getTime());
+function asDate(dateLike) {
+  if (dateLike instanceof Date) return new Date(dateLike.getFullYear(), dateLike.getMonth(), dateLike.getDate());
+  if (typeof dateLike === 'string') {
+    // parse aman untuk 'YYYY-MM-DD' (hindari offset timezone)
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(dateLike);
+    if (m) {
+      const y = +m[1], mo = +m[2], da = +m[3];
+      return new Date(y, mo - 1, da); // local 00:00
+    }
+    const d = new Date(dateLike);
+    if (!Number.isNaN(d.getTime())) return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }
+  return new Date('invalid'); // biar ketahuan saat logging
+}
+const isWeekend = (dateLike) => {
+  const d = asDate(dateLike);
+  const day = d.getDay(); // 0=Min,6=Sab
+  // console.log(`isWeekend: date=${toYMD(d)}, day=${day}`);
+  return day === 0 || day === 6;
+};
+
+const isWorkdayByLocation = (dateLike, locationId, specialIds = [1, 5, 12, 16]) => {
+  const d = asDate(dateLike);
+  const weekend = isWeekend(d);
+  // console.log(`isWorkdayByLocation: locationId=${locationId}, date=${toYMD(d)}, isWeekend=${weekend}`);
+  // lokasi "spesial" hanya kerja Sen–Jum; lainnya selalu kerja
+  return specialIds.includes(Number(locationId)) ? !weekend : true;
+};
+const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
+const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
+
+// bucket skor ala Excel
+const scoreFromCount = (n) => (n >= 5 ? 0 : n === 4 ? 20 : n === 3 ? 40 : n === 2 ? 60 : n === 1 ? 80 : 100);
+const alpaFactor     = (n) => (n >= 5 ? 0.0 : n === 4 ? 0.2 : n === 3 ? 0.4 : n === 2 ? 0.6 : n === 1 ? 0.8 : 1.0);
+
+// ===== Inti perhitungan: kembalikan payload siap pakai =====
 async function computeNilaiGradePayload(req, db) {
   const { user_id } = req.query;
   let { start_date, end_date, start, end, bulan, tahun } = req.query;
