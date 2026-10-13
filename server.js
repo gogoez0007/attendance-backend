@@ -4,14 +4,11 @@ require('dotenv').config();
 
 const app = express();
 
-// ✅ Konfigurasi CORS yang benar
-app.use(cors({
-  origin: 'http://localhost:3000', // Ganti sesuai URL frontend
-  credentials: true               // Izinkan credentials
-}));
+// ✅ Konfigurasi CORS & Body Parser
+app.use(cors());
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/uploads', express.static('uploads'));
 
 
@@ -28,15 +25,22 @@ app.use('/api/shifts', shiftRoutes);
 const attendanceRoutes = require('./routes/attendanceRoutes');
 app.use('/api/attendance', attendanceRoutes);
 
+const attendanceController = require('./controllers/attendanceController');
+app.get('/api/hari-libur', attendanceController.getHariLibur);
+app.get('/api/leave-requests', attendanceController.getUserLeaveRequests);
+app.get('/api/leave-requests/:id', attendanceController.getUserLeaveRequests);
+
 const userShiftRoutes = require('./routes/userShiftRoutes');
 app.use('/api/user_shifts', userShiftRoutes);
 
 const settingRoutes = require('./routes/settingsRoutes');
 app.use('/api/setting', settingRoutes);
-app.use('/api/user_shifts', userShiftRoutes);
 
 const notificationRoutes = require('./routes/notificationFirebaseRoutes');
 app.use('/api/notif', notificationRoutes);
+
+const approvalRoutes = require('./routes/approvalRoutes');
+app.use('/api/approval', approvalRoutes);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

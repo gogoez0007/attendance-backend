@@ -14,9 +14,118 @@ exports.getAttendances = async (req, res) => {
 exports.getAttendanceById = async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.query('SELECT * FROM attendance WHERE user_id = ? AND date=Date(now())', [id]);
+    const { month, year } = req.query;
+
+    if (month && year) {
+      const m = parseInt(month, 10);
+      const y = parseInt(year, 10);
+      const startDate = `${y}-${String(m).padStart(2, '0')}-01`;
+      const lastDay = new Date(y, m, 0).getDate();
+      const endDate = `${y}-${String(m).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+
+      // 1. Data kehadiran bulanan
+      const [rows] = await db.query(
+        `SELECT a.id, a.user_id, a.shift_id,
+                DATE_FORMAT(a.date, '%Y-%m-%d') AS date,
+                TIME_FORMAT(a.check_in_time, '%H:%i:%s') AS check_in_time,
+                TIME_FORMAT(a.check_out_time, '%H:%i:%s') AS check_out_time,
+                a.check_in_latitude, a.check_in_longitude,
+                a.check_out_latitude, a.check_out_longitude,
+                a.leave_request_id,
+                lr.leave_type,
+                lr.reason AS leave_reason,
+                s.start_time AS shift_start_time,
+                s.end_time AS shift_end_time
+         FROM attendance a
+         JOIN users u ON u.id = a.user_id
+         LEFT JOIN shifts s ON s.id = u.shift_id
+         LEFT JOIN leave_requests lr ON lr.id = a.leave_request_id
+         WHERE a.user_id = ?
+           AND a.date BETWEEN ? AND ?
+         ORDER BY a.date ASC`,
+        [id, startDate, endDate]
+      );
+
+      // 2. Data pengajuan izin/cuti/sakit yang aktif di bulan ini
+      const [leaveRows] = await db.query(
+        `SELECT id, user_id, full_name, leave_type, reason,
+                DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
+                DATE_FORMAT(return_date, '%Y-%m-%d') AS return_date,
+                DATE_FORMAT(submission_date, '%Y-%m-%d') AS submission_date
+         FROM leave_requests
+         WHERE user_id = ?
+           AND ((start_date BETWEEN ? AND ?) OR (return_date BETWEEN ? AND ?) OR (start_date <= ? AND return_date >= ?))
+         ORDER BY start_date ASC`,
+        [id, startDate, endDate, startDate, endDate, startDate, endDate]
+      );
+
+      return res.json({
+        attendance: rows || [],
+        leave_requests: leaveRows || [],
+      });
+    }
+
+    const [rows] = await db.query(
+      `SELECT a.*, lr.leave_type, lr.reason AS leave_reason
+       FROM attendance a
+       LEFT JOIN leave_requests lr ON lr.id = a.leave_request_id
+       WHERE a.user_id = ? AND a.date = DATE(NOW())`,
+      [id]
+    );
     if (rows.length === 0) return res.status(404).json({ message: 'Attendance not found' });
     res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.getEmployeeOffDays = async (req, res) => {
+  try {
+    const { user_id, start_date, end_date } = req.query;
+    let query = 'SELECT id, user_id, DATE_FORMAT(off_date, "%Y-%m-%d") AS off_date, reason, source FROM employee_off_days WHERE 1=1';
+    const params = [];
+    if (user_id) { query += ' AND user_id = ?'; params.push(user_id); }
+    if (start_date) { query += ' AND off_date >= ?'; params.push(start_date); }
+    if (end_date) { query += ' AND off_date <= ?'; params.push(end_date); }
+    query += ' ORDER BY off_date ASC';
+    const [rows] = await db.query(query, params);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.getUserLeaveRequests = async (req, res) => {
+  try {
+    const userId = req.params.id || req.query.user_id;
+    let query = `SELECT id, user_id, full_name, leave_type, reason, department_division,
+                        DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
+                        DATE_FORMAT(return_date, '%Y-%m-%d') AS return_date,
+                        DATE_FORMAT(submission_date, '%Y-%m-%d') AS submission_date
+                 FROM leave_requests`;
+    const params = [];
+    if (userId) {
+      query += ' WHERE user_id = ?';
+      params.push(userId);
+    }
+    query += ' ORDER BY start_date DESC';
+    const [rows] = await db.query(query, params);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.getHariLibur = async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    let query = 'SELECT id, DATE_FORMAT(tanggal, "%Y-%m-%d") AS tanggal, nama, jenis, keterangan FROM hari_libur WHERE 1=1';
+    const params = [];
+    if (from) { query += ' AND tanggal >= ?'; params.push(from); }
+    if (to) { query += ' AND tanggal <= ?'; params.push(to); }
+    query += ' ORDER BY tanggal ASC';
+    const [rows] = await db.query(query, params);
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -218,8 +327,9 @@ exports.handleAttendance = async (req, res) => {
       );
 
       try {
+        const recipients = [...new Set([Number(user_id), 23, 15].filter(Boolean))];
         await notificationService.sendFCMNotification(
-          [23, 15],
+          recipients,
           '📲 Notifikasi Absensi',
           `${namaLengkap} berhasil absen pulang pada ${new Date(check_in_time).toLocaleTimeString('id-ID')}`,
           'https://delmargroup.id/wp-content/uploads/2025/07/KPI.jpg'
@@ -279,8 +389,9 @@ exports.handleAttendance = async (req, res) => {
             );
 
             try {
+              const recipients = [...new Set([Number(user_id), 23, 15].filter(Boolean))];
               await notificationService.sendFCMNotification(
-                [23, 15],
+                recipients,
                 '📲 Notifikasi Absensi',
                 `${namaLengkap} berhasil absen pulang pada ${new Date(check_in_time).toLocaleTimeString('id-ID')}`,
                 'https://delmargroup.id/wp-content/uploads/2025/07/KPI.jpg'
@@ -372,8 +483,9 @@ exports.handleAttendance = async (req, res) => {
     );
 
     try {
+      const recipients = [...new Set([Number(user_id), 23, 15].filter(Boolean))];
       await notificationService.sendFCMNotification(
-        [23, 15],
+        recipients,
         '📲 Notifikasi Absensi',
         `${namaLengkap} berhasil absen datang pada ${new Date(check_in_time).toLocaleTimeString('id-ID')}`,
         'https://delmargroup.id/wp-content/uploads/2025/07/KPI.jpg'
@@ -434,7 +546,7 @@ const isWorkdayByLocation = (dateLike, locationId, specialIds = [1, 5, 12, 16]) 
   return specialIds.includes(Number(locationId)) ? !weekend : true;
 };
 const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
-const isEmptyTime = (t) => t == null || t === '' || t === '00:00';
+const isEmptyTime = (t) => t == null || t === '' || t === '00:00' || t === '00:00:00' || t === '0000-00-00 00:00:00';
 
 // bucket skor ala Excel
 const scoreFromCount = (n) => (n >= 5 ? 0 : n === 4 ? 20 : n === 3 ? 40 : n === 2 ? 60 : n === 1 ? 80 : 100);

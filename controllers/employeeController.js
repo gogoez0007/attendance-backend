@@ -10,11 +10,33 @@ exports.getEmployees = async (req, res) => {
     }
 };
 
-// ✅ Get Employee by ID
+// ✅ Get Employee by ID with latest Location & Shift
 exports.getEmployeeById = async (req, res) => {
     try {
         const { id } = req.params;
-        const [rows] = await db.query('SELECT * FROM users WHERE id = ?', [id]);
+        const query = `
+            SELECT 
+                a.id, 
+                a.name, 
+                a.username, 
+                a.position, 
+                a.department, 
+                a.phone,
+                a.shift_id,
+                a.location_id,
+                b.name AS shift_name,
+                b.start_time AS in_time,
+                b.end_time AS out_time,
+                c.name AS location_name,
+                c.latitude, 
+                c.longitude, 
+                c.radius_meters
+            FROM users a 
+            LEFT JOIN shifts b ON a.shift_id = b.id
+            LEFT JOIN locations c ON a.location_id = c.id
+            WHERE a.id = ?
+        `;
+        const [rows] = await db.query(query, [id]);
         if (rows.length === 0) return res.status(404).json({ message: 'Employee not found' });
         res.json(rows[0]);
     } catch (err) {
@@ -34,6 +56,8 @@ exports.loginAuth = async (req, res) => {
                             a.position, 
                             a.department, 
                             a.phone,
+                            a.location_id,
+                            c.name AS location_name,
                             b.start_time as in_time,
                             b.end_time AS out_time,
                             c.latitude, 
