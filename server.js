@@ -19,6 +19,9 @@ app.use('/api', kpiRoutes);
 const employeeRoutes = require('./routes/employeeRoutes');
 app.use('/api/employees', employeeRoutes);
 
+const locationRoutes = require('./routes/locationRoutes');
+app.use('/api/locations', locationRoutes);
+
 const shiftRoutes = require('./routes/shiftRoutes');
 app.use('/api/shifts', shiftRoutes);
 

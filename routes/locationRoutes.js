@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const locationController = require('../controllers/locationController');
 
+router.get('/rules', locationController.getLocationRules);
 router.get('/', locationController.getLocations);
 router.get('/:id', locationController.getLocationById);
 router.post('/', locationController.createLocation);

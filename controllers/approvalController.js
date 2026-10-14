@@ -46,10 +46,25 @@ async function syncLeaveToAttendance(leaveId) {
     if (!lrs || lrs.length === 0) return;
     const lr = lrs[0];
 
-    // 2. Ambil user info (location_id & shift_id)
-    const [users] = await db.query('SELECT id, location_id, shift_id FROM users WHERE id = ?', [lr.user_id]);
+    // 2. Ambil user info (location_id & shift_id & location_name)
+    const [users] = await db.query(`
+      SELECT u.id, u.location_id, u.shift_id, l.name AS location_name 
+      FROM users u 
+      LEFT JOIN locations l ON u.location_id = l.id 
+      WHERE u.id = ?
+    `, [lr.user_id]);
     const user = users[0] || {};
-    const isLocation1 = Number(user.location_id) === 1;
+
+    // Cek apakah lokasi karyawan 5 hari kerja dari location_rules
+    let is5DaysLocation = false;
+    if (user.location_id) {
+      const [rules] = await db.query('SELECT is_5_days FROM location_rules WHERE location_id = ?', [user.location_id]);
+      if (rules.length > 0) {
+        is5DaysLocation = Boolean(rules[0].is_5_days);
+      } else {
+        is5DaysLocation = Number(user.location_id) === 1;
+      }
+    }
 
     // 3. Ambil shift bounds
     let shift = { start_time: '08:00:00', end_time: '17:00:00' };
@@ -86,8 +101,8 @@ async function syncLeaveToAttendance(leaveId) {
 
     for (const d of dates) {
       const dayOfWeek = new Date(`${d}T00:00:00`).getDay(); // 0: Sun, 6: Sat
-      if (isLocation1 && (dayOfWeek === 0 || dayOfWeek === 6)) {
-        continue; // Skip weekend untuk lokasi kantor pusat (location_id = 1)
+      if (is5DaysLocation && (dayOfWeek === 0 || dayOfWeek === 6)) {
+        continue; // Skip weekend untuk lokasi kantor / 5 hari kerja
       }
 
       let setCheckIn = null;
@@ -121,6 +136,10 @@ async function syncLeaveToAttendance(leaveId) {
           updateSql += ', check_out_time = ?';
           updateParams.push(setCheckOut);
         }
+        if (user.location_name) {
+          updateSql += ', location_name = COALESCE(location_name, ?)';
+          updateParams.push(user.location_name);
+        }
 
         updateSql += ' WHERE id = ?';
         updateParams.push(att[0].id);
@@ -129,15 +148,16 @@ async function syncLeaveToAttendance(leaveId) {
         // INSERT record attendance baru
         await db.query(`
           INSERT INTO attendance 
-            (user_id, shift_id, date, check_in_time, check_out_time, leave_request_id, created_date)
-          VALUES (?, ?, ?, ?, ?, ?, NOW())
+            (user_id, shift_id, date, check_in_time, check_out_time, leave_request_id, location_name, created_date)
+          VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
         `, [
           lr.user_id,
           user.shift_id || 1,
           d,
           setCheckIn || '00:00:00',
           setCheckOut || null,
-          leaveId
+          leaveId,
+          user.location_name || null
         ]);
       }
     }

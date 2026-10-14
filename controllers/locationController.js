@@ -10,6 +10,22 @@ exports.getLocations = async (req, res) => {
     }
 };
 
+// ✅ Get Location Rules & Work Schedule Types
+exports.getLocationRules = async (req, res) => {
+    try {
+        const [rows] = await db.query(`
+            SELECT lr.id, lr.location_id, lr.location_name, lr.work_day_type, lr.is_5_days, lr.is_operational_tambak, lr.description,
+                   l.latitude, l.longitude, l.radius_meters
+            FROM location_rules lr
+            JOIN locations l ON lr.location_id = l.id
+            ORDER BY lr.location_id ASC
+        `);
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
 // ✅ Get Location by ID
 exports.getLocationById = async (req, res) => {
     try {

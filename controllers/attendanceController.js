@@ -133,10 +133,18 @@ exports.getHariLibur = async (req, res) => {
 
 exports.createAttendance = async (req, res) => {
   try {
-    const { user_id, check_in_time, check_in_latitude, check_in_longitude, check_in_image } = req.body;
+    const { user_id, check_in_time, check_in_latitude, check_in_longitude, check_in_image, location_name } = req.body;
+    let finalLocationName = location_name || null;
+    if (!finalLocationName) {
+      const [[userLoc]] = await db.query(
+        'SELECT l.name FROM users u JOIN locations l ON u.location_id = l.id WHERE u.id = ?',
+        [user_id]
+      );
+      if (userLoc) finalLocationName = userLoc.name;
+    }
     await db.query(
-      'INSERT INTO attendance (user_id, check_in_time, check_in_latitude, check_in_longitude, check_in_image) VALUES (?, ?, ?, ?, ?)',
-      [user_id, check_in_time, check_in_latitude, check_in_longitude, check_in_image]
+      'INSERT INTO attendance (user_id, check_in_time, check_in_latitude, check_in_longitude, check_in_image, location_name) VALUES (?, ?, ?, ?, ?, ?)',
+      [user_id, check_in_time, check_in_latitude, check_in_longitude, check_in_image, finalLocationName]
     );
     res.status(201).json({ message: 'Attendance created successfully' });
   } catch (err) {
@@ -257,13 +265,81 @@ async function getEmployeeOffDay(db, user_id, dateStr) {
   return row || null;
 }
 
+async function resolveLocationName(db, userId, lat, lng, inputLocationName) {
+  if (inputLocationName && String(inputLocationName).trim().length > 0) {
+    return String(inputLocationName).trim();
+  }
+
+  // Cek apakah koordinat berada di dalam radius salah satu lokasi
+  if (lat && lng) {
+    try {
+      const [locRows] = await db.query('SELECT name, latitude, longitude, radius_meters FROM locations');
+      const lat1 = Number(lat);
+      const lon1 = Number(lng);
+      let closestLoc = null;
+      let minDistance = Infinity;
+
+      for (const loc of locRows) {
+        const lat2 = Number(loc.latitude);
+        const lon2 = Number(loc.longitude);
+        if (!isNaN(lat2) && !isNaN(lon2)) {
+          const R = 6371e3;
+          const phi1 = (lat1 * Math.PI) / 180;
+          const phi2 = (lat2 * Math.PI) / 180;
+          const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
+          const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
+          const a = Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
+                    Math.cos(phi1) * Math.cos(phi2) *
+                    Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
+          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+          const dist = R * c;
+
+          if (dist <= (loc.radius_meters || 100)) {
+            return loc.name;
+          }
+          if (dist < minDistance) {
+            minDistance = dist;
+            closestLoc = loc.name;
+          }
+        }
+      }
+      if (closestLoc && minDistance < 50000) {
+        return closestLoc;
+      }
+    } catch (e) {
+      console.warn('Error resolving location by coordinates:', e.message);
+    }
+  }
+
+  // Fallback ke profil lokasi user
+  try {
+    const [[userLoc]] = await db.query(
+      'SELECT l.name FROM users u JOIN locations l ON u.location_id = l.id WHERE u.id = ?',
+      [userId]
+    );
+    if (userLoc && userLoc.name) return userLoc.name;
+  } catch (e) {
+    console.warn('Error resolving user location name:', e.message);
+  }
+
+  return null;
+}
+
 exports.handleAttendance = async (req, res) => {
   try {
-    const { user_id, check_in_time, check_in_latitude, check_in_longitude } = req.body;
+    const { user_id, check_in_time, check_in_latitude, check_in_longitude, location_name } = req.body;
 
     if (!user_id || !check_in_time) {
       return res.status(400).json({ message: 'user_id dan check_in_time wajib' });
     }
+
+    const resolvedLocationName = await resolveLocationName(
+      db,
+      user_id,
+      check_in_latitude,
+      check_in_longitude,
+      location_name
+    );
 
     const [[user]] = await db.query(
       'SELECT id, name, shift_id FROM users WHERE id = ?',
@@ -321,9 +397,10 @@ exports.handleAttendance = async (req, res) => {
         `UPDATE attendance
          SET check_out_time = ?,
              check_out_latitude = ?,
-             check_out_longitude = ?
+             check_out_longitude = ?,
+             location_name = COALESCE(location_name, ?)
          WHERE id = ?`,
-        [check_in_time, check_in_latitude, check_in_longitude, openToday.id]
+        [check_in_time, check_in_latitude, check_in_longitude, resolvedLocationName, openToday.id]
       );
 
       try {
@@ -383,9 +460,10 @@ exports.handleAttendance = async (req, res) => {
               `UPDATE attendance
                SET check_out_time = ?,
                    check_out_latitude = ?,
-                   check_out_longitude = ?
+                   check_out_longitude = ?,
+                   location_name = COALESCE(location_name, ?)
                WHERE id = ?`,
-              [check_in_time, check_in_latitude, check_in_longitude, openYesterday.id]
+              [check_in_time, check_in_latitude, check_in_longitude, resolvedLocationName, openYesterday.id]
             );
 
             try {
@@ -477,9 +555,9 @@ exports.handleAttendance = async (req, res) => {
 
     await db.query(
       `INSERT INTO attendance
-       (user_id, check_in_time, check_in_latitude, check_in_longitude, date)
-       VALUES (?, ?, ?, ?, ?)`,
-      [user_id, check_in_time, check_in_latitude, check_in_longitude, shiftDateStr]
+       (user_id, check_in_time, check_in_latitude, check_in_longitude, location_name, date)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [user_id, check_in_time, check_in_latitude, check_in_longitude, resolvedLocationName, shiftDateStr]
     );
 
     try {
@@ -538,12 +616,12 @@ const isWeekend = (dateLike) => {
   return day === 0 || day === 6;
 };
 
-const isWorkdayByLocation = (dateLike, locationId, specialIds = [1, 5, 12, 16]) => {
+const isWorkdayByLocation = (dateLike, locationId, fiveDayIds = []) => {
   const d = asDate(dateLike);
   const weekend = isWeekend(d);
   // console.log(`isWorkdayByLocation: locationId=${locationId}, date=${toYMD(d)}, isWeekend=${weekend}`);
-  // lokasi "spesial" hanya kerja Sen–Jum; lainnya selalu kerja
-  return specialIds.includes(Number(locationId)) ? !weekend : true;
+  // lokasi 5 hari kerja hanya kerja Sen–Jum; lainnya selalu kerja
+  return fiveDayIds.includes(Number(locationId)) ? !weekend : true;
 };
 const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
 const isEmptyTime = (t) => t == null || t === '' || t === '00:00' || t === '00:00:00' || t === '0000-00-00 00:00:00';
@@ -567,11 +645,22 @@ async function computeNilaiGradePayload(req, db) {
   }
 
   const [[user]] = await db.query(
-    'SELECT id, shift_id, location_id FROM users WHERE id = ? LIMIT 1',
+    'SELECT id, shift_id, location_id, position FROM users WHERE id = ? LIMIT 1',
     [userIdInt]
   );
 
   if (!user) throw new HttpError(404, 'User tidak ditemukan.');
+
+  // Ambil aturan 5 hari kerja dari location_rules
+  const [locRules] = await db.query('SELECT location_id, is_5_days FROM location_rules');
+  const fiveDayLocationIds = locRules.filter(r => r.is_5_days === 1).map(r => Number(r.location_id));
+
+  const posLower = (user.position || '').toLowerCase();
+  const isOfficeRole = ['manager', 'hr', 'admin', 'accounting', 'finance', 'director', 'office', 'sales', 'procurement', 'it']
+    .some(k => posLower.includes(k));
+  if (isOfficeRole && !fiveDayLocationIds.includes(Number(user.location_id))) {
+    fiveDayLocationIds.push(Number(user.location_id));
+  }
 
   let startDate;
   let endDate;
@@ -678,7 +767,7 @@ async function computeNilaiGradePayload(req, db) {
     }
 
     const dateObj = new Date(`${d}T00:00:00`);
-    const isWorkdayBase = isWorkdayByLocation(dateObj, user.location_id);
+    const isWorkdayBase = isWorkdayByLocation(dateObj, user.location_id, fiveDayLocationIds);
     const isHoliday = holidaySet.has(d);
     const isEmployeeOff = employeeOffSet.has(d);
     const isWorkday = isWorkdayBase && !isHoliday && !isEmployeeOff;

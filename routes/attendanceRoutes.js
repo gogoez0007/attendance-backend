@@ -6,6 +6,8 @@ router.get('/get_grade', attendanceController.getNilaiGrade);
 router.get('/get_grade_html', attendanceController.getNilaiGradeHtml);
 
 router.get('/', attendanceController.getAttendances);
+const locationController = require('../controllers/locationController');
+router.get('/location-rules', locationController.getLocationRules);
 router.get('/employee-off-days', attendanceController.getEmployeeOffDays);
 router.get('/hari-libur', attendanceController.getHariLibur);
 router.get('/leave-requests', attendanceController.getUserLeaveRequests);
