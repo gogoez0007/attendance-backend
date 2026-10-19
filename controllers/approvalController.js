@@ -67,9 +67,9 @@ async function syncLeaveToAttendance(leaveId) {
     }
 
     // 3. Ambil shift bounds
-    let shift = { start_time: '08:00:00', end_time: '17:00:00' };
+    let shift = { start_time: '08:00:00', end_time: '17:00:00', name: '' };
     if (user.shift_id) {
-      const [shifts] = await db.query('SELECT start_time, end_time FROM shifts WHERE id = ?', [user.shift_id]);
+      const [shifts] = await db.query('SELECT start_time, end_time, name FROM shifts WHERE id = ?', [user.shift_id]);
       if (shifts.length > 0) shift = shifts[0];
     }
 
@@ -101,8 +101,29 @@ async function syncLeaveToAttendance(leaveId) {
 
     for (const d of dates) {
       const dayOfWeek = new Date(`${d}T00:00:00`).getDay(); // 0: Sun, 6: Sat
-      if (is5DaysLocation && (dayOfWeek === 0 || dayOfWeek === 6)) {
-        continue; // Skip weekend untuk lokasi kantor / 5 hari kerja
+
+      // Cek apakah sudah ada baris attendance pada tanggal tersebut
+      const [att] = await db.query(
+        'SELECT id, check_in_time, check_out_time FROM attendance WHERE user_id = ? AND date = ? LIMIT 1',
+        [lr.user_id, d]
+      );
+
+      // Tentukan apakah hari ini adalah hari libur rutin bagi karyawan:
+      // - Shift 6 hari: hanya Minggu (0) yang libur rutin.
+      // - Shift 7 hari: tidak ada libur akhir pekan rutin.
+      // - Selain itu, jika lokasi 5 hari kerja, Sabtu (6) dan Minggu (0) adalah libur.
+      const isShift6Days = /6\s*hari/i.test(shift.name || '');
+      const isShift7Days = /7\s*hari/i.test(shift.name || '');
+      const isWeekendForUser = isShift7Days
+        ? false
+        : isShift6Days
+        ? dayOfWeek === 0
+        : is5DaysLocation && (dayOfWeek === 0 || dayOfWeek === 6);
+
+      // Lewati hari libur HANYA jika karyawan TIDAK memiliki baris absensi (tidak hadir)
+      // Jika karyawan sudah absen masuk (att.length > 0), jangan di-skip agar checkout izin tetap tersinkronisasi!
+      if (isWeekendForUser && att.length === 0) {
+        continue; // Skip weekend untuk lokasi kantor / 5 hari kerja jika tidak ada absensi
       }
 
       let setCheckIn = null;
@@ -116,12 +137,6 @@ async function syncLeaveToAttendance(leaveId) {
       } else if (isEarly) {
         setCheckOut = shift.end_time;
       }
-
-      // Cek apakah sudah ada baris attendance pada tanggal tersebut
-      const [att] = await db.query(
-        'SELECT id, check_in_time, check_out_time FROM attendance WHERE user_id = ? AND date = ? LIMIT 1',
-        [lr.user_id, d]
-      );
 
       if (att.length > 0) {
         // UPDATE record attendance (hubungkan leave_request_id, jangan menimpa jam check-in/out yang sudah ada)

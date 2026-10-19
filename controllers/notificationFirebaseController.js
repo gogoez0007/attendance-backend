@@ -3,8 +3,8 @@ const notificationService = require('../services/notificationService');
 
 exports.sendFCMNotification = async (req, res) => {
     try {
-        const { user_ids, title, body, imageUrl } = req.body;
-        const result = await notificationService.sendFCMNotification(user_ids, title, body, imageUrl);
+        const { user_ids, title, body, imageUrl, data } = req.body;
+        const result = await notificationService.sendFCMNotification(user_ids, title, body, imageUrl, data || {});
 
         res.status(200).json({
             message: 'Notification sent successfully',
