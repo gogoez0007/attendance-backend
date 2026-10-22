@@ -57,6 +57,13 @@ async function migrate() {
         category: 'Trading & Commerce',
         badge_color: '#4F46E5',
         icon_name: 'shopping_cart'
+      },
+      {
+        code: 'kemitraan',
+        name: 'Kemitraan Driver',
+        category: 'Logistik & Armada',
+        badge_color: '#059669',
+        icon_name: 'account_balance'
       }
     ];
 

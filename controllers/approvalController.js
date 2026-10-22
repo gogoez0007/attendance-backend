@@ -15,6 +15,24 @@ const path = require('path');
  * 5. Ingestion Dokumen Eksternal Odoo ERP
  */
 
+// Helper memformat kode sistem leave_type menjadi label bahasa Indonesia yang ramah pengguna
+function formatLeaveTypeLabel(type) {
+  if (!type) return 'Izin';
+  const clean = type.toString().trim().toUpperCase();
+  switch (clean) {
+    case 'PLANNED_ABSENCE': return 'Tidak Masuk Direncanakan';
+    case 'UNPLANNED_ABSENCE': return 'Tidak Masuk Mendadak';
+    case 'LEAVE_WORKPLACE': return 'Meninggalkan Tempat Kerja';
+    case 'LATE_ARRIVAL': return 'Datang Terlambat';
+    case 'EARLY_DEPARTURE': return 'Pulang Lebih Awal';
+    case 'LATE_ARRIVAL_OFFSITE': return 'Datang Terlambat Karena Dinas Luar';
+    case 'EARLY_DEPARTURE_OFFSITE': return 'Pulang Lebih Awal Karena Dinas Luar';
+    case 'SICK_NO_CERT': return 'Sakit Tanpa Surat Dokter';
+    case 'SICK_WITH_CERT': return 'Sakit (Ada Surat Dokter)';
+    default: return type.replace(/_/g, ' ');
+  }
+}
+
 // Super Admins yang memiliki otoritas melihat semua dokumen approval
 const SUPER_ADMIN_IDS = [23, 334, '23', '334'];
 
@@ -539,7 +557,7 @@ exports.submitLeaveRequest = async (req, res) => {
         await notificationService.sendFCMNotification(
           firstApproverIds,
           '📋 Permohonan Persetujuan Baru',
-          `${full_name} mengajukan ${leave_type} (${start_date} s/d ${return_date}). Ketuk untuk membuka detail.`,
+          `${full_name} mengajukan ${formatLeaveTypeLabel(leave_type)} (${start_date} s/d ${return_date}). Ketuk untuk membuka detail.`,
           '',
           {
             type: 'approval',
@@ -547,9 +565,9 @@ exports.submitLeaveRequest = async (req, res) => {
             approval_id: `att-leave-${leaveId}`,
             raw_id: String(leaveId),
             source: 'attendance',
-            category: 'Izin / Cuti',
+            category: 'Izin',
             requester_name: full_name,
-            title: `Pengajuan ${leave_type}`
+            title: `Pengajuan ${formatLeaveTypeLabel(leave_type)}`
           }
         );
       }
@@ -603,6 +621,7 @@ exports.getMyLeaveRequests = async (req, res) => {
     `, [user_id]);
 
     for (const row of rows) {
+      row.leave_type_label = formatLeaveTypeLabel(row.leave_type);
       const [approvers] = await db.query(`
         SELECT step_order, approver_name, status, notes,
                DATE_FORMAT(action_date, '%Y-%m-%d %H:%i') AS action_date
@@ -719,9 +738,11 @@ async function fetchApprovalsList(userId, options = {}) {
             id: `att-leave-${lr.id}`,
             raw_id: lr.id,
             code: `IZIN/ATT/${lr.id}`,
-            title: `Permohonan ${lr.leave_type ? lr.leave_type.replace(/_/g, ' ') : 'Izin'}`,
+            title: `Permohonan ${formatLeaveTypeLabel(lr.leave_type)}`,
+            leave_type: lr.leave_type,
+            leave_type_label: formatLeaveTypeLabel(lr.leave_type),
             source: 'attendance',
-            category: 'Izin / Cuti Karyawan',
+            category: 'Izin Karyawan',
             requester_name: lr.full_name || 'Karyawan',
             department: lr.department_division || lr.user_department || 'General',
             position: lr.position || null,
@@ -1145,7 +1166,7 @@ exports.processApproval = async (req, res) => {
             await notificationService.sendFCMNotification(
               [lrRows[0].user_id],
               '❌ Permohonan Izin Ditolak',
-              `Permohonan ${lrRows[0].leave_type} Anda ditolak${notes ? ': ' + notes : '.'}`,
+              `Permohonan ${formatLeaveTypeLabel(lrRows[0].leave_type)} Anda ditolak${notes ? ': ' + notes : '.'}`,
               '',
               {
                 type: 'leave_status',
@@ -1178,7 +1199,7 @@ exports.processApproval = async (req, res) => {
             await notificationService.sendFCMNotification(
               [lrRows[0].user_id],
               '✅ Permohonan Izin Disetujui',
-              `Permohonan ${lrRows[0].leave_type} Anda telah disetujui sepenuhnya.`,
+              `Permohonan ${formatLeaveTypeLabel(lrRows[0].leave_type)} Anda telah disetujui sepenuhnya.`,
               '',
               {
                 type: 'leave_status',
@@ -1207,7 +1228,7 @@ exports.processApproval = async (req, res) => {
             const notificationService = require('../services/notificationService');
             const [lrRows] = await db.query('SELECT full_name, leave_type FROM leave_requests WHERE id = ?', [rawLeaveId]);
             const requester = lrRows.length > 0 ? lrRows[0].full_name : 'Karyawan';
-            const lType = lrRows.length > 0 ? lrRows[0].leave_type : 'Izin';
+            const lType = lrRows.length > 0 ? formatLeaveTypeLabel(lrRows[0].leave_type) : 'Izin';
 
             await notificationService.sendFCMNotification(
               [nextApp[0].approver_user_id],
@@ -1220,7 +1241,7 @@ exports.processApproval = async (req, res) => {
                 approval_id: `att-leave-${rawLeaveId}`,
                 raw_id: String(rawLeaveId),
                 source: 'attendance',
-                category: 'Izin / Cuti',
+                category: 'Izin',
                 requester_name: requester
               }
             );
@@ -1233,7 +1254,7 @@ exports.processApproval = async (req, res) => {
 
     return res.json({
       success: true,
-      message: `Permohonan Izin / Cuti [${id}] berhasil di-${isApproved ? 'setujui' : 'tolak'}. Data kehadiran & leave request telah diperbarui.`,
+      message: `Permohonan Izin [${id}] berhasil di-${isApproved ? 'setujui' : 'tolak'}. Data kehadiran & leave request telah diperbarui.`,
       data: {
         id,
         source: 'attendance',
@@ -1314,10 +1335,10 @@ exports.syncExternalDocument = async (req, res) => {
     // Kirim notifikasi ke approver tingkat pertama
     try {
       if (approver_user_ids.length > 0) {
-        const firstUid = parseInt(approver_user_ids[0], 10);
+        const targetUids = approver_user_ids.map(u => parseInt(u, 10)).filter(Boolean);
         const notificationService = require('../services/notificationService');
         await notificationService.sendFCMNotification(
-          [firstUid],
+          targetUids,
           `📋 Permohonan Persetujuan: ${title}`,
           `Dokumen ${doc_ref} (${doc_type || 'Umum'}) dari ${requester_name} membutuhkan persetujuan Anda.`,
           '',
