@@ -652,8 +652,19 @@ async function computeNilaiGradePayload(req, db) {
   }
 
   const [[user]] = await db.query(
-    'SELECT id, shift_id, location_id, position FROM users WHERE id = ? LIMIT 1',
-    [userIdInt]
+    `SELECT
+       u.id, u.shift_id, u.location_id, u.position,
+       DATE_FORMAT(u.created_at, '%Y-%m-%d') AS user_created_date,
+       DATE_FORMAT(min_att.first_att, '%Y-%m-%d') AS first_attendance_date
+     FROM users u
+     LEFT JOIN (
+       SELECT user_id, MIN(date) AS first_att
+       FROM attendance
+       WHERE user_id = ?
+     ) min_att ON min_att.user_id = u.id
+     WHERE u.id = ?
+     LIMIT 1`,
+    [userIdInt, userIdInt]
   );
 
   if (!user) throw new HttpError(404, 'User tidak ditemukan.');
@@ -703,6 +714,34 @@ async function computeNilaiGradePayload(req, db) {
   const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
   const effectiveEnd = cmpDate(endDate, todayStr) === 1 ? todayStr : endDate;
 
+  // Tanggal aktif pertama kali (berdasarkan absensi pertama, fallback ke tanggal user dibuat)
+  const firstActiveDate = user.first_attendance_date || user.user_created_date;
+
+  // Jika periode evaluasi yang diminta berada SEBELUM karyawan mulai aktif
+  if (firstActiveDate && cmpDate(firstActiveDate, effectiveEnd) > 0) {
+    return {
+      periode: { start: startDate, end: endDate, end_effective: effectiveEnd },
+      nilai: 100,
+      grade: '-',
+      total_absen_lengkap: 0,
+      total_izin: 0,
+      total_telat: 0,
+      total_tidak_lengkap: 0,
+      total_alpa: 0,
+      total_sakit: 0,
+      absen_datang: null,
+      absen_pulang: null,
+      keterangan: `Karyawan belum memiliki riwayat absensi pada periode ini (Mulai aktif: ${firstActiveDate})`
+    };
+  }
+
+  // Jika karyawan baru mulai aktif setelah startDate (masuk bukan tanggal 1),
+  // mulai evaluasi dari tanggal absensi pertamanya!
+  let effectiveStart = startDate;
+  if (firstActiveDate && cmpDate(firstActiveDate, startDate) > 0) {
+    effectiveStart = firstActiveDate;
+  }
+
   const [attendance] = await db.query(
     `SELECT
        DATE_FORMAT(a.date,'%Y-%m-%d') AS date,
@@ -715,7 +754,7 @@ async function computeNilaiGradePayload(req, db) {
      LEFT JOIN leave_requests lr ON lr.id = a.leave_request_id
      WHERE a.user_id = ?
        AND a.date BETWEEN ? AND ?`,
-    [userIdInt, startDate, effectiveEnd]
+    [userIdInt, effectiveStart, effectiveEnd]
   );
 
   const attMap = new Map(attendance.map(r => [r.date, r]));
@@ -723,23 +762,30 @@ async function computeNilaiGradePayload(req, db) {
   const [lateRows] = await db.query(
     `SELECT
        DATE_FORMAT(a.date,'%Y-%m-%d') AS date,
-       TIMESTAMPDIFF(SECOND, s.start_time, a.check_in_time) AS diff_sec
+       COALESCE(ssch.id, sa.id, su.id) as shift_id,
+       COALESCE(ssch.name, sa.name, su.name) as shift_name,
+       COALESCE(ssch.start_time, sa.start_time, su.start_time) as start_time,
+       COALESCE(ssch.end_time, sa.end_time, su.end_time) as end_time,
+       TIMESTAMPDIFF(SECOND, COALESCE(ssch.start_time, sa.start_time, su.start_time), a.check_in_time) AS diff_sec
      FROM attendance a
      JOIN users u ON u.id = a.user_id
-     LEFT JOIN shifts s ON s.id = u.shift_id
+     LEFT JOIN shifts su ON su.id = u.shift_id
+     LEFT JOIN shift_schedules sch ON sch.user_id = a.user_id AND sch.schedule_date = a.date
+     LEFT JOIN shifts ssch ON ssch.id = sch.shift_id
+     LEFT JOIN shifts sa ON sa.id = a.shift_id
      WHERE a.user_id = ?
        AND a.date BETWEEN ? AND ?
        AND a.check_in_time IS NOT NULL`,
-    [userIdInt, startDate, effectiveEnd]
+    [userIdInt, effectiveStart, effectiveEnd]
   );
 
-  const lateMap = new Map(lateRows.map(r => [r.date, r.diff_sec]));
+  const lateMap = new Map(lateRows.map(r => [r.date, r]));
 
   const [holidayRows] = await db.query(
     `SELECT DATE_FORMAT(tanggal, '%Y-%m-%d') AS date
      FROM hari_libur
      WHERE tanggal BETWEEN ? AND ?`,
-    [startDate, effectiveEnd]
+    [effectiveStart, effectiveEnd]
   );
 
   const holidaySet = new Set(holidayRows.map(h => h.date));
@@ -749,7 +795,7 @@ async function computeNilaiGradePayload(req, db) {
      FROM employee_off_days
      WHERE user_id = ?
        AND off_date BETWEEN ? AND ?`,
-    [userIdInt, startDate, effectiveEnd]
+    [userIdInt, effectiveStart, effectiveEnd]
   );
 
   const employeeOffSet = new Set(employeeOffRows.map(r => r.date));
@@ -762,7 +808,7 @@ async function computeNilaiGradePayload(req, db) {
   let terlambatHari = 0;
   let totalKehadiranHari = 0;
 
-  for (let d = startDate; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
+  for (let d = effectiveStart; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
     const rec = attMap.get(d);
 
     if (rec && !isEmptyTime(rec.check_in_time) && !isEmptyTime(rec.check_out_time)) {
@@ -777,7 +823,14 @@ async function computeNilaiGradePayload(req, db) {
 
     if (!isWorkday) continue;
 
+    const isToday = (d === todayStr);
+
     if (!rec) {
+      if (isToday) {
+        // Jika hari ini belum absen, jangan langsung dianggap alpa
+        // karena jam kerja hari ini masih berjalan / belum dimulai
+        continue;
+      }
       alpa += 1;
       continue;
     }
@@ -812,10 +865,31 @@ async function computeNilaiGradePayload(req, db) {
     }
 
     if ((hasIn && !hasOut) || (!hasIn && hasOut)) {
-      tidakLengkap += 1;
+      let isStillWorkingToday = false;
+      if (isToday && hasIn && !hasOut) {
+        const shiftInfo = lateMap.get(d);
+        if (shiftInfo && shiftInfo.end_time) {
+          const st = parseHMS(shiftInfo.start_time);
+          const et = parseHMS(shiftInfo.end_time);
+          const isOvernight = (et.h * 3600 + et.m * 60 + et.s) < (st.h * 3600 + st.m * 60 + st.s);
+          const endDT = makeDateTime(d, shiftInfo.end_time);
+          if (isOvernight) endDT.setDate(endDT.getDate() + 1);
+          endDT.setMinutes(endDT.getMinutes() + 30);
+          if (new Date() < endDT) {
+            isStillWorkingToday = true;
+          }
+        } else {
+          isStillWorkingToday = true;
+        }
+      }
+
+      if (!isStillWorkingToday) {
+        tidakLengkap += 1;
+      }
     }
 
-    const diffSec = lateMap.get(d);
+    const lateInfo = lateMap.get(d);
+    const diffSec = lateInfo?.diff_sec;
 
     if (diffSec != null && diffSec > 180) {
       terlambatHari += 1;
@@ -853,7 +927,7 @@ async function computeNilaiGradePayload(req, db) {
   const totalSakit = sakit + sd;
 
   return {
-    periode: { start: startDate, end: endDate, end_effective: effectiveEnd },
+    periode: { start: effectiveStart, end: endDate, end_effective: effectiveEnd },
     nilai,
     grade,
     total_absen_lengkap: totalKehadiranHari,
@@ -901,7 +975,7 @@ exports.getNilaiGradeHtml = async (req, res) => {
       C: { start: '#fbbf24', end: '#f59e0b', tint: '#fde68a' },
       D: { start: '#fb923c', end: '#f97316', tint: '#fdba74' },
       E: { start: '#f87171', end: '#ef4444', tint: '#fca5a5' }
-    }[data.grade || 'E'];
+    }[data.grade] || { start: '#94a3b8', end: '#64748b', tint: '#cbd5e1' };
 
     const nilai = Math.max(0, Math.min(100, Number(data.nilai || 0)));
 
