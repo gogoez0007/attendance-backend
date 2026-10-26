@@ -19,12 +19,23 @@ if (!admin.apps.length) {
  * @returns {Promise<Array>} hasil pengiriman FCM
  */
 exports.sendFCMNotification = async (userIds, title, body, imageUrl = '', data = {}) => {
-    if (!userIds || !title || !body) {
-        throw new Error('userIds, title, dan body wajib diisi');
+    // 1. Jika userIds adalah 'all', '*', atau tidak diisi: otomatis jalankan broadcast
+    const isBroadcast = !userIds || userIds === 'all' || userIds === '*' || (Array.isArray(userIds) && (userIds.length === 0 || userIds.includes('all')));
+    if (isBroadcast) {
+        if (!title || !body) {
+            throw new Error('title dan body wajib diisi untuk broadcast notifikasi.');
+        }
+        return exports.broadcastFCMNotification(title, body, imageUrl, data);
     }
 
-    const idList = Array.isArray(userIds) ? userIds : [userIds];
-    if (idList.length === 0) return [];
+    if (!title || !body) {
+        throw new Error('title dan body wajib diisi');
+    }
+
+    const idList = (Array.isArray(userIds) ? userIds : [userIds]).filter(id => id !== null && id !== undefined && id !== '');
+    if (idList.length === 0) {
+        return exports.broadcastFCMNotification(title, body, imageUrl, data);
+    }
 
     // Ambil token dari DB
     const [rows] = await db.query(
@@ -111,3 +122,99 @@ exports.sendFCMNotification = async (userIds, title, body, imageUrl = '', data =
     console.log(`✅ FCM terkirim ke ${successful} dari ${tokens.length} token`);
     return results;
 };
+
+/**
+ * Broadcast notifikasi ke seluruh user aktif yang memiliki token FCM
+ * @param {String} title
+ * @param {String} body
+ * @param {String} imageUrl
+ * @param {Object} data - custom payload data
+ * @returns {Promise<Object>} hasil pengiriman FCM
+ */
+exports.broadcastFCMNotification = async (title, body, imageUrl = '', data = {}) => {
+    if (!title || !body) {
+        throw new Error('title dan body wajib diisi untuk broadcast');
+    }
+
+    // Ambil seluruh token user aktif dari DB
+    const [rows] = await db.query(
+        "SELECT id, name, token FROM users WHERE (is_active = 1 OR is_active IS NULL) AND token IS NOT NULL AND token != ''"
+    );
+
+    const tokens = rows.map(r => r.token).filter(Boolean);
+    if (tokens.length === 0) {
+        console.log('⚠️ Tidak ada user dengan token FCM aktif untuk di-broadcast');
+        return { total: 0, successful: 0, failed: 0 };
+    }
+
+    console.log(`📢 Memulai broadcast notifikasi ke ${tokens.length} user...`);
+
+    // Format data menjadi string key-value untuk FCM
+    const stringData = {};
+    if (data && typeof data === 'object') {
+        for (const [k, v] of Object.entries(data)) {
+            if (v !== undefined && v !== null) {
+                stringData[k] = String(v);
+            }
+        }
+    }
+    stringData['click_action'] = 'FLUTTER_NOTIFICATION_CLICK';
+
+    const baseMessage = {
+        notification: {
+            title,
+            body,
+            image: imageUrl || undefined,
+        },
+        data: stringData,
+        android: {
+            priority: 'high',
+            notification: {
+                channelId: 'attendance_high_channel',
+                clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+            }
+        },
+        apns: {
+            payload: {
+                aps: {
+                    sound: 'default',
+                }
+            }
+        }
+    };
+
+    // Firebase sendEachForMulticast mendukung hingga 500 token per batch
+    const batchSize = 500;
+    let totalSuccess = 0;
+    let totalFailed = 0;
+    const failedErrors = [];
+
+    for (let i = 0; i < tokens.length; i += batchSize) {
+        const batchTokens = tokens.slice(i, i + batchSize);
+        try {
+            const response = await admin.messaging().sendEachForMulticast({
+                ...baseMessage,
+                tokens: batchTokens,
+            });
+            totalSuccess += response.successCount;
+            totalFailed += response.failureCount;
+            response.responses.forEach(resp => {
+                if (!resp.success) {
+                    failedErrors.push(resp.error?.message);
+                }
+            });
+        } catch (batchErr) {
+            console.error('❌ Gagal kirim batch FCM:', batchErr);
+            totalFailed += batchTokens.length;
+        }
+    }
+
+    console.log(`✅ Broadcast selesai: ${totalSuccess} berhasil, ${totalFailed} gagal dari total ${tokens.length} token.`);
+    return {
+        total: tokens.length,
+        successful: totalSuccess,
+        failed: totalFailed,
+        sampleFailedErrors: failedErrors.slice(0, 5)
+    };
+};
+
