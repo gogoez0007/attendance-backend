@@ -81,7 +81,8 @@ exports.updateLocationRule = async (req, res) => {
         const location_id = req.params.location_id || req.params.id;
         const { work_day_type, description, is_operational_tambak } = req.body;
 
-        const normalizedType = ['5_DAYS', '6_DAYS', '7_DAYS'].includes(String(work_day_type || '').toUpperCase())
+        const validTypes = ['5_DAYS', '6_DAYS', 'FIXED_6_DAYS', 'ROSTER_6_DAYS', '7_DAYS'];
+        const normalizedType = validTypes.includes(String(work_day_type || '').toUpperCase())
             ? String(work_day_type).toUpperCase()
             : '5_DAYS';
         const is5Days = normalizedType === '5_DAYS' ? 1 : 0;

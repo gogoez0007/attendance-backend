@@ -126,20 +126,33 @@ async function syncLeaveToAttendance(leaveId) {
         [lr.user_id, d]
       );
 
-      // Tentukan apakah hari ini adalah hari libur rutin berdasarkan konfigurasi lokasi:
-      // - 7_DAYS: Operasional shift / setiap hari (tidak ada libur akhir pekan rutin).
-      // - 6_DAYS: Hanya Minggu (0) yang libur rutin.
-      // - 5_DAYS: Sabtu (6) dan Minggu (0) adalah libur rutin.
-      const isWeekendForUser = (workDayType === '7_DAYS')
-        ? false
-        : (workDayType === '6_DAYS')
-        ? (dayOfWeek === 0)
-        : (dayOfWeek === 0 || dayOfWeek === 6);
+      // 1. Cek apakah tanggal ini terdaftar sebagai hari OFF resmi karyawan di employee_off_days
+      const [offRows] = await db.query(
+        'SELECT id FROM employee_off_days WHERE user_id = ? AND off_date = ? LIMIT 1',
+        [lr.user_id, d]
+      );
+      const isEmployeeOffDay = offRows.length > 0;
 
-      // Lewati hari libur HANYA jika karyawan TIDAK memiliki baris absensi (tidak hadir)
+      // 2. Tentukan apakah tanggal ini adalah hari libur bagi karyawan:
+      // - ROSTER_6_DAYS (NUSEA / Security / Shift): Bekerja 6 hari, 1 hari OFF bergilir.
+      //   Hari libur HANYA jika tercatat di employee_off_days. Sabtu & Minggu adalah HARI KERJA NORMAL jika bukan hari OFF!
+      // - 7_DAYS: Operasional penuh setiap hari (libur HANYA jika tercatat di employee_off_days).
+      // - 6_DAYS / FIXED_6_DAYS: 6 hari kerja tetap (Minggu libur kalender atau jika ada jadwal OFF).
+      // - 5_DAYS: Kantor 5 hari kerja (Sabtu & Minggu libur kalender atau jika ada jadwal OFF).
+      let isOffDayForUser = false;
+      if (workDayType === 'ROSTER_6_DAYS' || workDayType === '7_DAYS') {
+        isOffDayForUser = isEmployeeOffDay;
+      } else if (workDayType === '6_DAYS' || workDayType === 'FIXED_6_DAYS') {
+        isOffDayForUser = (dayOfWeek === 0) || isEmployeeOffDay;
+      } else {
+        // Default 5_DAYS (kantor)
+        isOffDayForUser = (dayOfWeek === 0 || dayOfWeek === 6) || isEmployeeOffDay;
+      }
+
+      // Lewati hari libur/OFF HANYA jika karyawan TIDAK memiliki baris absensi (tidak hadir)
       // Jika karyawan sudah absen masuk (att.length > 0), jangan di-skip agar checkout izin tetap tersinkronisasi!
-      if (isWeekendForUser && att.length === 0) {
-        continue; // Skip weekend untuk lokasi kantor / 5 hari kerja jika tidak ada absensi
+      if (isOffDayForUser && att.length === 0) {
+        continue; // Skip hari libur / jadwal off jika tidak ada absensi
       }
 
       let setCheckIn = null;

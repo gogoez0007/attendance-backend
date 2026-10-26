@@ -621,8 +621,8 @@ const isWorkdayByLocation = (dateLike, locationId, locRuleConfig) => {
   const day = d.getDay();
   if (locRuleConfig instanceof Map) {
     const type = locRuleConfig.get(Number(locationId)) || '5_DAYS';
-    if (type === '7_DAYS') return true;
-    if (type === '6_DAYS') return day !== 0;
+    if (type === '7_DAYS' || type === 'ROSTER_6_DAYS') return true;
+    if (type === '6_DAYS' || type === 'FIXED_6_DAYS') return day !== 0;
     return day !== 0 && day !== 6;
   }
   if (Array.isArray(locRuleConfig)) {
