@@ -616,12 +616,19 @@ const isWeekend = (dateLike) => {
   return day === 0 || day === 6;
 };
 
-const isWorkdayByLocation = (dateLike, locationId, fiveDayIds = []) => {
+const isWorkdayByLocation = (dateLike, locationId, locRuleConfig) => {
   const d = asDate(dateLike);
-  const weekend = isWeekend(d);
-  // console.log(`isWorkdayByLocation: locationId=${locationId}, date=${toYMD(d)}, isWeekend=${weekend}`);
-  // lokasi 5 hari kerja hanya kerja Sen–Jum; lainnya selalu kerja
-  return fiveDayIds.includes(Number(locationId)) ? !weekend : true;
+  const day = d.getDay();
+  if (locRuleConfig instanceof Map) {
+    const type = locRuleConfig.get(Number(locationId)) || '5_DAYS';
+    if (type === '7_DAYS') return true;
+    if (type === '6_DAYS') return day !== 0;
+    return day !== 0 && day !== 6;
+  }
+  if (Array.isArray(locRuleConfig)) {
+    return locRuleConfig.includes(Number(locationId)) ? (day !== 0 && day !== 6) : true;
+  }
+  return day !== 0 && day !== 6;
 };
 const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
 const isEmptyTime = (t) => t == null || t === '' || t === '00:00' || t === '00:00:00' || t === '0000-00-00 00:00:00';
@@ -651,16 +658,12 @@ async function computeNilaiGradePayload(req, db) {
 
   if (!user) throw new HttpError(404, 'User tidak ditemukan.');
 
-  // Ambil aturan 5 hari kerja dari location_rules
-  const [locRules] = await db.query('SELECT location_id, is_5_days FROM location_rules');
-  const fiveDayLocationIds = locRules.filter(r => r.is_5_days === 1).map(r => Number(r.location_id));
-
-  const posLower = (user.position || '').toLowerCase();
-  const isOfficeRole = ['manager', 'hr', 'admin', 'accounting', 'finance', 'director', 'office', 'sales', 'procurement', 'it']
-    .some(k => posLower.includes(k));
-  if (isOfficeRole && !fiveDayLocationIds.includes(Number(user.location_id))) {
-    fiveDayLocationIds.push(Number(user.location_id));
-  }
+  // Ambil aturan hari kerja dari location_rules (100% dinamis per lokasi)
+  const [locRules] = await db.query('SELECT location_id, is_5_days, work_day_type FROM location_rules');
+  const locRuleMap = new Map(locRules.map(r => [
+    Number(r.location_id),
+    r.work_day_type || (r.is_5_days === 1 ? '5_DAYS' : '7_DAYS')
+  ]));
 
   let startDate;
   let endDate;
@@ -767,7 +770,7 @@ async function computeNilaiGradePayload(req, db) {
     }
 
     const dateObj = new Date(`${d}T00:00:00`);
-    const isWorkdayBase = isWorkdayByLocation(dateObj, user.location_id, fiveDayLocationIds);
+    const isWorkdayBase = isWorkdayByLocation(dateObj, user.location_id, locRuleMap);
     const isHoliday = holidaySet.has(d);
     const isEmployeeOff = employeeOffSet.has(d);
     const isWorkday = isWorkdayBase && !isHoliday && !isEmployeeOff;

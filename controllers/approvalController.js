@@ -73,14 +73,14 @@ async function syncLeaveToAttendance(leaveId) {
     `, [lr.user_id]);
     const user = users[0] || {};
 
-    // Cek apakah lokasi karyawan 5 hari kerja dari location_rules
-    let is5DaysLocation = false;
+    // Cek aturan hari kerja dari location_rules (100% dinamis per lokasi)
+    let workDayType = '5_DAYS';
     if (user.location_id) {
-      const [rules] = await db.query('SELECT is_5_days FROM location_rules WHERE location_id = ?', [user.location_id]);
+      const [rules] = await db.query('SELECT work_day_type, is_5_days FROM location_rules WHERE location_id = ?', [user.location_id]);
       if (rules.length > 0) {
-        is5DaysLocation = Boolean(rules[0].is_5_days);
+        workDayType = rules[0].work_day_type || (rules[0].is_5_days ? '5_DAYS' : '7_DAYS');
       } else {
-        is5DaysLocation = Number(user.location_id) === 1;
+        workDayType = Number(user.location_id) === 1 ? '5_DAYS' : '7_DAYS';
       }
     }
 
@@ -126,17 +126,15 @@ async function syncLeaveToAttendance(leaveId) {
         [lr.user_id, d]
       );
 
-      // Tentukan apakah hari ini adalah hari libur rutin bagi karyawan:
-      // - Shift 6 hari: hanya Minggu (0) yang libur rutin.
-      // - Shift 7 hari: tidak ada libur akhir pekan rutin.
-      // - Selain itu, jika lokasi 5 hari kerja, Sabtu (6) dan Minggu (0) adalah libur.
-      const isShift6Days = /6\s*hari/i.test(shift.name || '');
-      const isShift7Days = /7\s*hari/i.test(shift.name || '');
-      const isWeekendForUser = isShift7Days
+      // Tentukan apakah hari ini adalah hari libur rutin berdasarkan konfigurasi lokasi:
+      // - 7_DAYS: Operasional shift / setiap hari (tidak ada libur akhir pekan rutin).
+      // - 6_DAYS: Hanya Minggu (0) yang libur rutin.
+      // - 5_DAYS: Sabtu (6) dan Minggu (0) adalah libur rutin.
+      const isWeekendForUser = (workDayType === '7_DAYS')
         ? false
-        : isShift6Days
-        ? dayOfWeek === 0
-        : is5DaysLocation && (dayOfWeek === 0 || dayOfWeek === 6);
+        : (workDayType === '6_DAYS')
+        ? (dayOfWeek === 0)
+        : (dayOfWeek === 0 || dayOfWeek === 6);
 
       // Lewati hari libur HANYA jika karyawan TIDAK memiliki baris absensi (tidak hadir)
       // Jika karyawan sudah absen masuk (att.length > 0), jangan di-skip agar checkout izin tetap tersinkronisasi!
