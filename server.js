@@ -4,12 +4,31 @@ require('dotenv').config();
 
 const app = express();
 
+app.use((req, res, next) => {
+  console.log('REQ LOG:', req.method, req.url, 'IP:', req.ip, 'Host:', req.headers.host, 'UA:', req.headers['user-agent']);
+  next();
+});
+
+
 // ✅ Konfigurasi CORS & Body Parser
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token', 'X-Requested-With', 'Accept', 'Origin']
+}));
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-app.use('/uploads', express.static('uploads'));
+app.use(
+  '/uploads',
+  (req, res, next) => {
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    next();
+  },
+  cors({ origin: true, credentials: true }),
+  express.static('uploads')
+);
 
 
 const kpiRoutes = require('./routes/kpiRoutes');
