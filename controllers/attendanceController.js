@@ -630,6 +630,105 @@ const isWorkdayByLocation = (dateLike, locationId, locRuleConfig) => {
   }
   return day !== 0 && day !== 6;
 };
+
+// Kelompokkan hari dalam rentang tanggal ke dalam minggu (Senin s/d Minggu)
+function groupDaysByWeek(startDateStr, endDateStr) {
+  const weeks = [];
+  let currentWeek = [];
+
+  let d = new Date(`${startDateStr}T00:00:00`);
+  const end = new Date(`${endDateStr}T00:00:00`);
+
+  while (d <= end) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dayNum = String(d.getDate()).padStart(2, '0');
+    const dateStr = `${y}-${m}-${dayNum}`;
+    const dow = d.getDay(); // 0 = Minggu, 1 = Senin, ..., 6 = Sabtu
+
+    currentWeek.push({ dateStr, dow });
+
+    if (dow === 0 || d.getTime() === end.getTime()) {
+      weeks.push([...currentWeek]);
+      currentWeek = [];
+    }
+
+    d.setDate(d.getDate() + 1);
+  }
+
+  return weeks;
+}
+
+// Evaluasi Alpa mingguan untuk lokasi ROSTER_6_DAYS:
+// Target adalah 6 hari kerja per minggu (dikurangi hari libur nasional & jadwal off resmi).
+// Hari Minggu dihitung sebagai hari kerja jika karyawan masuk di hari Minggu.
+// Karyawan reguler Senin-Sabtu (seperti Pak Joko) yang sudah masuk 6 hari tidak dianggap Alpa di hari Minggu.
+// Jika dalam 1 minggu tidak mencapai target hari kerja (misal cuma masuk 5 hari tanpa izin/libur), kekurangannya dihitung Alpa.
+function evaluateWeeklyAlpaForRoster6Days(weeks, attMap, holidaySet, employeeOffSet, todayStr) {
+  let totalAlpa = 0;
+
+  for (const week of weeks) {
+    const evaluatedDays = [];
+
+    for (const d of week) {
+      if (d.dateStr < todayStr) {
+        evaluatedDays.push(d);
+      } else if (d.dateStr === todayStr) {
+        const rec = attMap.get(d.dateStr);
+        if (rec && (rec.check_in_time || rec.check_out_time || rec.leave_request_id)) {
+          evaluatedDays.push(d);
+        }
+      }
+    }
+
+    if (evaluatedDays.length === 0) continue;
+
+    let weekFulfilled = 0;
+    let weekHolidays = 0;
+    let weekScheduledOff = 0;
+
+    for (const d of evaluatedDays) {
+      const isOffDay = employeeOffSet.size > 0 ? employeeOffSet.has(d.dateStr) : (d.dow === 0);
+      const isHoliday = holidaySet.has(d.dateStr) && !isOffDay;
+      const rec = attMap.get(d.dateStr);
+
+      if (isHoliday) weekHolidays++;
+      if (employeeOffSet.has(d.dateStr)) weekScheduledOff++;
+
+      if (rec) {
+        if (rec.leave_request_id) {
+          weekFulfilled++;
+        } else if (rec.check_in_time || rec.check_out_time) {
+          weekFulfilled++;
+        }
+      }
+    }
+
+    const hasSunday = evaluatedDays.some(d => d.dow === 0);
+    const N = evaluatedDays.length;
+
+    let target = 0;
+    if (N === 7) {
+      // 1 minggu penuh (Senin - Minggu): standar 6 hari kerja, 1 hari libur
+      const maxOff = Math.max(1, weekScheduledOff);
+      target = Math.max(0, 7 - maxOff - weekHolidays);
+    } else if (hasSunday) {
+      // Minggu parsial yang memuat hari Minggu (misal awal bulan Kamis-Minggu)
+      const maxOff = Math.max(1, weekScheduledOff);
+      target = Math.max(0, N - maxOff - weekHolidays);
+    } else {
+      // Minggu parsial tanpa hari Minggu (misal akhir bulan Senin-Selasa)
+      const maxOff = weekScheduledOff;
+      target = Math.max(0, N - maxOff - weekHolidays);
+    }
+
+    const shortfall = Math.max(0, target - weekFulfilled);
+    totalAlpa += shortfall;
+  }
+
+  return totalAlpa;
+}
+
 const hasDinasLuar = (txt) => /dinas\s*luar/i.test(String(txt || ''));
 const isEmptyTime = (t) => t == null || t === '' || t === '00:00' || t === '00:00:00' || t === '0000-00-00 00:00:00';
 
@@ -808,30 +907,28 @@ async function computeNilaiGradePayload(req, db) {
   let terlambatHari = 0;
   let totalKehadiranHari = 0;
 
+  const locType = locRuleMap.get(Number(user.location_id)) || '5_DAYS';
+
   for (let d = effectiveStart; cmpDate(d, effectiveEnd) <= 0; d = addDays(d, 1)) {
     const rec = attMap.get(d);
+    const isToday = (d === todayStr);
 
     if (rec && !isEmptyTime(rec.check_in_time) && !isEmptyTime(rec.check_out_time)) {
       totalKehadiranHari += 1;
     }
 
-    const dateObj = new Date(`${d}T00:00:00`);
-    const isWorkdayBase = isWorkdayByLocation(dateObj, user.location_id, locRuleMap);
-    const isHoliday = holidaySet.has(d);
-    const isEmployeeOff = employeeOffSet.has(d);
-    const isWorkday = isWorkdayBase && !isHoliday && !isEmployeeOff;
-
-    if (!isWorkday) continue;
-
-    const isToday = (d === todayStr);
-
     if (!rec) {
-      if (isToday) {
-        // Jika hari ini belum absen, jangan langsung dianggap alpa
-        // karena jam kerja hari ini masih berjalan / belum dimulai
-        continue;
+      if (locType !== 'ROSTER_6_DAYS') {
+        const dateObj = new Date(`${d}T00:00:00`);
+        const isWorkdayBase = isWorkdayByLocation(dateObj, user.location_id, locRuleMap);
+        const isHoliday = holidaySet.has(d);
+        const isEmployeeOff = employeeOffSet.has(d);
+        const isWorkday = isWorkdayBase && !isHoliday && !isEmployeeOff;
+
+        if (isWorkday && !isToday) {
+          alpa += 1;
+        }
       }
-      alpa += 1;
       continue;
     }
 
@@ -894,6 +991,15 @@ async function computeNilaiGradePayload(req, db) {
     if (diffSec != null && diffSec > 180) {
       terlambatHari += 1;
     }
+  }
+
+  // Khusus lokasi ROSTER_6_DAYS: Alpa dievaluasi secara mingguan (target 6 hari kerja per minggu)
+  // Hari Minggu tetap dihitung bila karyawan bekerja di hari Minggu.
+  // Karyawan reguler Senin-Sabtu (seperti Pak Joko) yang sudah masuk 6 hari tidak dianggap Alpa di hari Minggu.
+  // Jika dalam 1 minggu tidak mencapai target hari kerja (6 hari dikurangi libur nasional), kekurangannya dihitung Alpa.
+  if (locType === 'ROSTER_6_DAYS') {
+    const weeks = groupDaysByWeek(effectiveStart, effectiveEnd);
+    alpa = evaluateWeeklyAlpaForRoster6Days(weeks, attMap, holidaySet, employeeOffSet, todayStr);
   }
 
   const komponen =
